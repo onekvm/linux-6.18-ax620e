@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menuconfig ARCH_AXERA
+	bool "Axera SoC Support"
+	depends on ARCH_MULTI_V7
+	select ARM_GIC
+	select HAVE_ARM_ARCH_TIMER
+	select NO_IOPORT_MAP
+	help
+	  Support for Axera AX620E family SoCs such as AX620Q.
+
+if ARCH_AXERA
+
+config ARCH_AX620E
+	bool "Axera AX620X family"
+	default y
+	help
+	  Support for Axera AX620E SoC family.
+
+endif

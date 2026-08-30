@@ -115,6 +115,7 @@ obj-$(CONFIG_COMMON_CLK_XGENE)		+= clk-xgene.o
 obj-y					+= actions/
 obj-y					+= analogbits/
 obj-$(CONFIG_COMMON_CLK_AT91)		+= at91/
+obj-y					+= axera/
 obj-$(CONFIG_ARCH_ARTPEC)		+= axis/
 obj-$(CONFIG_ARC_PLAT_AXS10X)		+= axs10x/
 obj-$(CONFIG_CLK_BAIKAL_T1)		+= baikal-t1/

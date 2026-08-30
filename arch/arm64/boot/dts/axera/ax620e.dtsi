@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Axera AX620E SoC (AArch64)
+ */
+
+#include <dt-bindings/clock/ax620e-clock.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	compatible = "axera,ax620e";
+	interrupt-parent = <&gic>;
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0>;
+			enable-method = "psci";
+			clocks = <&clk_cpu AX620X_CLK_CPU_SEL>;
+		};
+
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x1>;
+			enable-method = "psci";
+			clocks = <&clk_cpu AX620X_CLK_CPU_SEL>;
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-1.0", "arm,psci-0.2";
+		method = "smc";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		gic: interrupt-controller@1851000 {
+			compatible = "arm,gic-400";
+			reg = <0x0 0x01851000 0x0 0x1000>,
+			      <0x0 0x01852000 0x0 0x2000>,
+			      <0x0 0x01854000 0x0 0x2000>,
+			      <0x0 0x01856000 0x0 0x2000>;
+			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-controller;
+			#interrupt-cells = <3>;
+		};
+
+		clk_cpu: clock-controller@1900000 {
+			compatible = "axera,ax620x-cpu-clk";
+			reg = <0x0 0x01900000 0x0 0x1000>;
+			#clock-cells = <1>;
+		};
+
+		clk_pllc: clock-controller@2210000 {
+			compatible = "axera,ax620x-pllc-clk";
+			reg = <0x0 0x02210000 0x0 0x1000>;
+			#clock-cells = <1>;
+		};
+
+		clk_common: clock-controller@2340000 {
+			compatible = "axera,ax620x-common-clk";
+			reg = <0x0 0x02340000 0x0 0x1000>;
+			#clock-cells = <1>;
+		};
+
+		uart0: serial@4880000 {
+			compatible = "snps,dw-apb-uart";
+			reg = <0x0 0x04880000 0x0 0x400>;
+			interrupts = <GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <208000000>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			status = "disabled";
+		};
+	};
+};

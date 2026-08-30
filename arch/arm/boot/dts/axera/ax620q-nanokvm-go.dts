@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * NanoKVM Go (AX620Q)
+ */
+
+/dts-v1/;
+
+#include "ax620e.dtsi"
+
+/ {
+	model = "Sipeed NanoKVM Go (AX620Q)";
+	compatible = "sipeed,nanokvm-go", "axera,ax620q", "axera,ax620e";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x10000000>;
+	};
+};
+
+&uart0 {
+	status = "okay";
+};

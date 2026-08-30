@@ -47,6 +47,14 @@ config ARCH_ARTPEC
 	help
 	   This enables support for the ARMv8 based ARTPEC SoC Family.
 
+config ARCH_AXERA
+	bool "Axera SoC Platforms"
+	select ARM_AMBA
+	select ARM_GIC
+	select COMMON_CLK
+	help
+	  This enables support for Axera AX620E family SoCs such as AX630C.
+
 config ARCH_AXIADO
 	bool "Axiado SoC Family"
 	select GPIOLIB

@@ -7,6 +7,7 @@ subdir-y += amazon
 subdir-y += amlogic
 subdir-y += arm
 subdir-y += aspeed
+subdir-y += axera
 subdir-y += axis
 subdir-y += broadcom
 subdir-y += calxeda
