@@ -6,6 +6,8 @@
 
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mmc/host.h>
@@ -88,6 +90,7 @@ struct sdhci_cdns_priv {
 	void __iomem *ctl_addr;	/* write control */
 	spinlock_t wrlock;	/* write lock */
 	bool enhanced_strobe;
+	bool phy_dll_reset;
 	void (*priv_writel)(struct sdhci_cdns_priv *priv, u32 val, void __iomem *reg);
 	struct reset_control *rst_hw;
 	unsigned int nr_phy_params;
@@ -101,6 +104,7 @@ struct sdhci_cdns_phy_cfg {
 
 struct sdhci_cdns_drv_data {
 	int (*init)(struct platform_device *pdev);
+	bool phy_dll_reset;
 	const struct sdhci_pltfm_data pltfm_data;
 };
 
@@ -187,9 +191,21 @@ static void sdhci_cdns_phy_param_parse(struct device_node *np,
 	}
 }
 
+/* Vendor sdhci-axera.c: pulse PHY DLL reset before the delay params. */
+#define SDHCI_CDNS_PHY_DLL_RESET	0x0f
+
 static int sdhci_cdns_phy_init(struct sdhci_cdns_priv *priv)
 {
 	int ret, i;
+
+	if (priv->phy_dll_reset) {
+		ret = sdhci_cdns_write_phy_reg(priv, SDHCI_CDNS_PHY_DLL_RESET, 0);
+		if (ret)
+			return ret;
+		ret = sdhci_cdns_write_phy_reg(priv, SDHCI_CDNS_PHY_DLL_RESET, 1);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < priv->nr_phy_params; i++) {
 		ret = sdhci_cdns_write_phy_reg(priv, priv->phy_params[i].addr,
@@ -500,6 +516,107 @@ static const struct sdhci_cdns_drv_data sdhci_eyeq_drv_data = {
 	},
 };
 
+static int sdhci_axera_deassert(struct device *dev, const char *name)
+{
+	struct reset_control *rst;
+	int ret;
+
+	rst = devm_reset_control_get_optional_exclusive(dev, name);
+	if (IS_ERR(rst))
+		return dev_err_probe(dev, PTR_ERR(rst), "reset %s\n", name);
+	ret = reset_control_deassert(rst);
+	if (ret)
+		return dev_err_probe(dev, ret, "deassert %s\n", name);
+	return 0;
+}
+
+static int sdhci_axera_init(struct platform_device *pdev)
+{
+	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	void __iomem *cpu, *flash;
+	resource_size_t start;
+	int ret;
+
+	if (!res)
+		return -EINVAL;
+	start = res->start;
+
+	/* Vendor sdhci-axera releases prst, arst and cardrst before the card clock. */
+	ret = sdhci_axera_deassert(&pdev->dev, "prst");
+	if (ret)
+		return ret;
+	ret = sdhci_axera_deassert(&pdev->dev, "arst");
+	if (ret)
+		return ret;
+	ret = sdhci_axera_deassert(&pdev->dev, "cardrst");
+	if (ret)
+		return ret;
+
+	cpu = ioremap(0x01900000, 0x2020);
+	if (!cpu)
+		return -ENOMEM;
+	if (start == 0x01b40000) {
+		writel(BIT(2), cpu + 0x2004);
+		udelay(2);
+		writel(0x3 << 5, cpu + 0x2000);
+		writel(0x3 << 5, cpu + 0x1000);
+		writel(BIT(2), cpu + 0x1004);
+		writel(GENMASK(5, 0), cpu + 0x200c);
+		writel(0x1, cpu + 0x100c);
+		writel(BIT(6), cpu + 0x100c);
+		udelay(2);
+		writel(BIT(6), cpu + 0x200c);
+	}
+	iounmap(cpu);
+
+	flash = ioremap(0x10030000, 0x8020);
+	if (!flash)
+		return -ENOMEM;
+	if (start == 0x104e0000) {
+		writel(BIT(17) | BIT(3), flash + 0x4008);
+		writel(BIT(9), flash + 0x8004);
+		udelay(2);
+		writel(0x3 << 16, flash + 0x8000);
+		writel(0x3 << 16, flash + 0x4000);
+		writel(BIT(9), flash + 0x4004);
+		writel(GENMASK(25, 20), flash + 0x800c);
+		writel(0x1 << 20, flash + 0x400c);
+		writel(BIT(26), flash + 0x400c);
+		udelay(2);
+		writel(BIT(26), flash + 0x800c);
+	}
+	if (start == 0x104d0000) {
+		writel(BIT(18) | BIT(4), flash + 0x4008);
+		writel(BIT(10), flash + 0x8004);
+		udelay(2);
+		writel(0x3 << 18, flash + 0x8000);
+		writel(0x3 << 18, flash + 0x4000);
+		writel(BIT(10), flash + 0x4004);
+		writel(GENMASK(5, 0), flash + 0x8010);
+		writel(0x1, flash + 0x4010);
+		writel(BIT(6), flash + 0x4010);
+		udelay(2);
+		writel(BIT(6), flash + 0x8010);
+	}
+	iounmap(flash);
+	return 0;
+}
+
+static const struct sdhci_cdns_drv_data sdhci_axera_drv_data = {
+	.init = sdhci_axera_init,
+	.phy_dll_reset = true,
+	.pltfm_data = {
+		.ops = &sdhci_cdns_ops,
+		/*
+		 * This Cadence host reports 64-bit ADMA but the v4 descriptor
+		 * walk corrupts kernel memory (GPT scan oops in blk_rq_map_sg).
+		 * DRAM is below 4 GiB, so 32-bit ADMA is enough.
+		 */
+		.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
+			   SDHCI_QUIRK2_BROKEN_64_BIT_DMA,
+	},
+};
+
 static const struct sdhci_cdns_drv_data sdhci_cdns_drv_data = {
 	.pltfm_data = {
 		.ops = &sdhci_cdns_ops,
@@ -575,6 +692,7 @@ static int sdhci_cdns_probe(struct platform_device *pdev)
 	priv->nr_phy_params = nr_phy_params;
 	priv->hrs_addr = host->ioaddr;
 	priv->enhanced_strobe = false;
+	priv->phy_dll_reset = data->phy_dll_reset;
 	priv->priv_writel = cdns_writel;
 	host->ioaddr += SDHCI_CDNS_SRS_BASE;
 	host->mmc_host_ops.hs400_enhanced_strobe =
@@ -652,6 +770,10 @@ static const struct of_device_id sdhci_cdns_match[] = {
 	{
 		.compatible = "mobileye,eyeq-sd4hc",
 		.data = &sdhci_eyeq_drv_data,
+	},
+	{
+		.compatible = "axera,sdhc",
+		.data = &sdhci_axera_drv_data,
 	},
 	{ .compatible = "cdns,sd4hc" },
 	{ /* sentinel */ }
