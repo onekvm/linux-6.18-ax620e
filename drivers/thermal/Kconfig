@@ -17,6 +17,13 @@ menuconfig THERMAL
 
 if THERMAL
 
+config AXERA_AX620E_THERMAL
+	tristate "Axera AX620E/AX630C temperature sensor"
+	depends on OF && ARCH_AXERA
+	select THERMAL_OF
+	help
+	  Read the on-chip temperature sensor on AX620E and AX630C SoCs.
+
 config THERMAL_NETLINK
 	bool "Thermal netlink management"
 	depends on NET
