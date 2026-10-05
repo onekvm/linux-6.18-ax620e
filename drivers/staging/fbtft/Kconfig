@@ -75,6 +75,12 @@ config FB_TFT_ILI9486
 	help
 	  Generic Framebuffer support for ILI9486
 
+config FB_TFT_JD9853
+	tristate "FB driver for the Jadard JD9853 LCD Controller"
+	help
+	  Framebuffer support for the Jadard JD9853 172x320 panel used on
+	  the Sipeed NanoKVM Pro Desk.
+
 config FB_TFT_PCD8544
 	tristate "FB driver for the PCD8544 LCD Controller"
 	help
