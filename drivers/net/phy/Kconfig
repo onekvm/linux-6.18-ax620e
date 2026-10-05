@@ -248,6 +248,12 @@ config INTEL_XWAY_PHY
 	  PEF 7061, PEF 7071 and PEF 7072 or integrated into the Intel
 	  SoCs xRX200, xRX300, xRX330, xRX350 and xRX550.
 
+config JLSEMI_PHY
+	tristate "JLSemi PHYs"
+	help
+	  JLSemi JL2xxx gigabit PHY (ID 0x937c403x) on NanoKVM Pro.
+	  Clause-22 only. Does not load the vendor microcode patch.
+
 config LSI_ET1011C_PHY
 	tristate "LSI ET1011C PHY"
 	help
