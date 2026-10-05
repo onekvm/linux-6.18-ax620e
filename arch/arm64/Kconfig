@@ -127,9 +127,10 @@ config ARM64
 	select ARM_GIC
 	select AUDIT_ARCH_COMPAT_GENERIC
 	select ARM_GIC_V2M if PCI
-	select ARM_GIC_V3
-	select ARM_GIC_V3_ITS if PCI
-	select ARM_GIC_V5
+	# The AX620E family uses GIC-400; it has no GICv3/v5 distributor.
+	select ARM_GIC_V3 if !ARCH_AXERA
+	select ARM_GIC_V3_ITS if PCI && !ARCH_AXERA
+	select ARM_GIC_V5 if !ARCH_AXERA
 	select ARM_PSCI_FW
 	select BUILDTIME_TABLE_SORT
 	select CLONE_BACKWARDS
@@ -1438,6 +1439,7 @@ endchoice
 
 choice
 	prompt "Virtual address space size"
+	default ARM64_VA_BITS_48 if ARCH_AXERA
 	default ARM64_VA_BITS_52
 	help
 	  Allows choosing one of multiple possible virtual address

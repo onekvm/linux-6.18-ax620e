@@ -52,6 +52,9 @@ config ARCH_AXERA
 	select ARM_AMBA
 	select ARM_GIC
 	select COMMON_CLK
+	select GPIOLIB
+	select PINCTRL
+	select RESET_CONTROLLER
 	help
 	  This enables support for Axera AX620E family SoCs such as AX630C.
 
