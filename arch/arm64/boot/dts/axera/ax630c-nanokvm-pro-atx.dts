@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Sipeed NanoKVM Pro PCIe / internal-bracket board (AX630C).
+ * The model string still contains "ATX"; userspace reports this board as PCIe.
+ *
+ * Same boot description as the Desk DTB, with the JD9853 SPI panel and its
+ * backlight hog removed. Do not boot this DTB on nanokvm-pro-105: that
+ * unit's U-Boot pinmux is the Desk panel.
+ *
+ * The 0.96" 128x64 OLED is not the SG2002 C906L SHM device. The vendor
+ * 4.19 NanoKVM DTS has no SSD1306 node, and i2c0 on that DTS is the LT6911
+ * HDMI receiver, so no controller is instantiated here. The in-tree driver
+ * is drivers/video/fbdev/ssd1307fb.c (compatible "solomon,ssd1306fb-i2c").
+ */
+
+#include "ax630c-nanokvm-pro.dts"
+
+/ {
+	model = "Sipeed NanoKVM Pro ATX (AX630C)";
+	/delete-node/ rotary-encoder;
+	/delete-node/ gpio-keys;
+	/delete-node/ panel-pwm;
+	/delete-node/ panel-backlight;
+};
+
+&spi2 {
+	status = "disabled";
+	/delete-node/ panel@1;
+};
