@@ -206,6 +206,36 @@ static void i2c_dw_remove_lock_support(struct dw_i2c_dev *dev)
 		i2c_dw_semaphore_cb_table[dev->semaphore_idx].remove(dev);
 }
 
+static void dw_i2c_assert_extra_reset(void *data)
+{
+	reset_control_assert(data);
+}
+
+/* Deassert every reset after the one dev->rst already owns. */
+static int dw_i2c_deassert_extra_resets(struct device *device)
+{
+	int count, i, ret;
+
+	count = reset_control_get_count(device);
+	if (count <= 1)
+		return 0;
+
+	for (i = 1; i < count; i++) {
+		struct reset_control *rst;
+
+		rst = devm_reset_control_get_exclusive_by_index(device, i);
+		if (IS_ERR(rst))
+			return dev_err_probe(device, PTR_ERR(rst),
+					     "failed to acquire reset %d\n", i);
+		reset_control_deassert(rst);
+		ret = devm_add_action_or_reset(device, dw_i2c_assert_extra_reset,
+					       rst);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int dw_i2c_plat_probe(struct platform_device *pdev)
 {
 	u32 flags = (uintptr_t)device_get_match_data(&pdev->dev);
@@ -241,6 +271,15 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 		return dev_err_probe(device, PTR_ERR(dev->rst), "failed to acquire reset\n");
 
 	reset_control_deassert(dev->rst);
+
+	/*
+	 * AX630C I2C0 has two reset lines (prst + rst). This driver only
+	 * deasserts index 0. Leaving index 1 asserted holds the block in
+	 * reset, so the LT6911 bus never leaves idle.
+	 */
+	ret = dw_i2c_deassert_extra_resets(device);
+	if (ret)
+		goto exit_reset;
 
 	ret = i2c_dw_fw_parse_and_configure(dev);
 	if (ret)
