@@ -39,6 +39,12 @@ static void write_pen_release(u64 val)
 	dcache_clean_inval_poc((unsigned long)start, (unsigned long)start + size);
 }
 
+void secondary_holding_pen_release_cpu(u64 hwid)
+{
+	write_pen_release(hwid);
+	sev();
+}
+
 
 static int smp_spin_table_cpu_init(unsigned int cpu)
 {

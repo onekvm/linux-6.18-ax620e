@@ -19,10 +19,43 @@
 
 #include <asm/cpu_ops.h>
 #include <asm/errno.h>
+#include <asm/smp.h>
 #include <asm/smp_plat.h>
+
+extern void secondary_holding_pen(void);
+void secondary_holding_pen_release_cpu(u64 hwid);
+
+/*
+ * AX630C arm64 ATF accepts PSCI CPU_ON only before Linux reprograms
+ * the GIC. cpu_init() runs from setup_arch(), before init_IRQ(). Park
+ * the secondary there; cpu_boot() only releases the holding pen.
+ * A later CPU_ON does not return. Do not use the 0x23400DC clock
+ * register as a spin-table mailbox.
+ */
+static bool axera_parked[NR_CPUS];
+
+static bool axera_early_psci(void)
+{
+	return of_machine_is_compatible("axera,ax620e") ||
+	       of_machine_is_compatible("axera,ax630c") ||
+	       of_machine_is_compatible("sipeed,nanokvm-pro");
+}
 
 static int __init cpu_psci_cpu_init(unsigned int cpu)
 {
+	int err;
+
+	if (!cpu || !axera_early_psci() || !psci_ops.cpu_on)
+		return 0;
+
+	err = psci_ops.cpu_on(cpu_logical_map(cpu),
+			      __pa_symbol(secondary_holding_pen));
+	if (err && err != -EPERM) {
+		pr_err("early CPU_ON of CPU%u failed: %d\n", cpu, err);
+		return err;
+	}
+	axera_parked[cpu] = true;
+	pr_info("CPU%u parked via PSCI before GIC init\n", cpu);
 	return 0;
 }
 
@@ -39,7 +72,14 @@ static int __init cpu_psci_cpu_prepare(unsigned int cpu)
 static int cpu_psci_cpu_boot(unsigned int cpu)
 {
 	phys_addr_t pa_secondary_entry = __pa_symbol(secondary_entry);
-	int err = psci_ops.cpu_on(cpu_logical_map(cpu), pa_secondary_entry);
+	int err;
+
+	if (axera_parked[cpu]) {
+		secondary_holding_pen_release_cpu(cpu_logical_map(cpu));
+		return 0;
+	}
+
+	err = psci_ops.cpu_on(cpu_logical_map(cpu), pa_secondary_entry);
 	if (err && err != -EPERM)
 		pr_err("failed to boot CPU%d (%d)\n", cpu, err);
 
