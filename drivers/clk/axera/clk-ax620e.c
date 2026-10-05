@@ -81,7 +81,8 @@ static const char *clk_bus_flash_sel[] __initdata = { "cpll_24m", "epll_125m", "
 
 static struct axera_mux_clock ax620x_mux_clks_cpu[] __initdata = {
 	{AX620X_CLK_H_SSI_SEL, "clk_h_ssi_sel", clk_h_ssi_sel, ARRAY_SIZE(clk_h_ssi_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 7, 3, 0, NULL,},
-	{AX620X_CLK_CPU_SEL, "clk_cpu_sel", clk_cpu_sel, ARRAY_SIZE(clk_cpu_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 2, 3, 0, NULL,},
+	/* No CLK_SET_RATE_PARENT: cpufreq must switch parents, not retune cpupll. */
+	{AX620X_CLK_CPU_SEL, "clk_cpu_sel", clk_cpu_sel, ARRAY_SIZE(clk_cpu_sel), CLK_IGNORE_UNUSED, 0x0, 2, 3, 0, NULL,},
 	{AX620X_CLK_BUS_FLASH_SEL, "clk_bus_flash_sel", clk_bus_flash_sel, ARRAY_SIZE(clk_bus_flash_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 0, 2, 0, NULL,},
 };
 
@@ -492,21 +493,30 @@ static const char *sclk_i2s_tdm_sel[] __initdata = { "hpll_16p384m", "hpll_20p48
 static const char *sclk_i2s_m_sel[] __initdata = { "hpll_16p384m", "hpll_20p48m", "hpll_24p576m" };
 static const char *clk_timer_sel[] __initdata = { "rtc_out_32k", "cpll_24m" };
 static const char *clk_i2s_ref0_sel[] __initdata = { "cpll_12m", "hpll_16p384m", "hpll_24p576m", "epll_25m" };
+/* MUX0[12:11] reads 3 on a board whose SSI clock is 208 MHz. */
+static const char *clk_spi_m_sel[] __initdata = { "cpll_24m", "epll_50m", "cpll_156m", "cpll_208m" };
+static const char *clk_i2c_sel[] __initdata = { "cpll_24m", "epll_50m", "cpll_156m", "cpll_208m" };
 
 static struct axera_mux_clock ax620x_mux_clks_periph[] __initdata = {
 	{AX620X_SCLK_I2S_TDM_SEL, "sclk_i2s_tdm_sel", sclk_i2s_tdm_sel, ARRAY_SIZE(sclk_i2s_tdm_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 23, 2, 0, NULL,},
 	{AX620X_SCLK_I2S_M_SEL, "sclk_i2s_m_sel", sclk_i2s_m_sel, ARRAY_SIZE(sclk_i2s_m_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 21, 2, 0, NULL,},
 	{AX620X_CLK_TIMER_SEL, "clk_timer_sel", clk_timer_sel, ARRAY_SIZE(clk_timer_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 13, 1, 0, NULL,},
+	{AX620X_CLK_SPI_M2_SEL, "clk_spi_m2_sel", clk_spi_m_sel, ARRAY_SIZE(clk_spi_m_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 11, 2, 0, NULL,},
 	{AX620X_CLK_I2S_REF0_SEL, "clk_i2s_ref0_sel", clk_i2s_ref0_sel, ARRAY_SIZE(clk_i2s_ref0_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 5, 2, 0, NULL,},
+	{AX620X_CLK_I2C_SEL, "clk_i2c_sel", clk_i2c_sel, ARRAY_SIZE(clk_i2c_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 3, 2, 0, NULL,},
 };
 
 static struct axera_gate_clock ax620x_gate_clks_periph[] __initdata = {
 	{AX620X_SCLK_I2S_TDM_EB, "sclk_i2s_tdm_eb", "sclk_i2s_tdm_divn", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 17, 1, 0, 0, 0, 0,},
 	{AX620X_SCLK_I2S_M_EB, "sclk_i2s_m_eb", "sclk_i2s_m_divn", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 16, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_TIMER_EB, "clk_timer_eb", "clk_timer_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 9, 1, 0, 0, 0, 0,},
+	/* EB0 bit (6 + spi_id); spi2 is bit 8. Vendor spi-dw writes the same bit. */
+	{AX620X_CLK_SPI_M2_EB, "clk_spi_m2_eb", "clk_spi_m2_sel", CLK_SET_RATE_PARENT, 0x4, 8, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_I2S_REF0_EB, "clk_i2s_ref0_eb", "clk_i2s_ref0_divn", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 4, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_I2C_EB, "clk_i2c_eb", "clk_i2c_sel", CLK_SET_RATE_PARENT, 0x4, 2, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_I2S_AUDIO_REF_EB, "clk_i2s_audio_ref_eb", "hpll_12p288m", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 3, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_TIMER0_EB, "clk_timer0_eb", "clk_timer_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x8, 31, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_I2C_MST0_EB, "clk_i2c_mst0_eb", "clk_i2c_eb", CLK_SET_RATE_PARENT, 0x8, 8, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_LPC_PERI_EB, "clk_lpc_peri_eb", "cpll_24m", CLK_SET_RATE_PARENT, 0x8, 18, 1, 0, 0, 0, 0,},
 	{AX620X_ACLK_AX_DMA_PER_EB, "aclk_ax_dma_per_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x8, 0, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_I2S_TDM_S_EB, "pclk_i2s_tdm_s_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0xC, 30, 1, 0, 0, 0, 0,},
@@ -514,7 +524,10 @@ static struct axera_gate_clock ax620x_gate_clks_periph[] __initdata = {
 	{AX620X_PCLK_I2S_S_EB, "pclk_i2s_s_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0xC, 28, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_I2S_M_EB, "pclk_i2s_m_eb", "pclk_top_sel", CLK_SET_RATE_PARENT , 0xC, 27, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_AX_DMA_PER_EB, "pclk_ax_dma_per_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0xC, 11, 1, 0, 0, 0, 0,},
+	{AX620X_PCLK_I2C_MST0_EB, "pclk_i2c_mst0_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0xC, 17, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_TIMER0_EB, "pclk_timer0_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x10, 5, 1, 0, 0, 0, 0,},
+	/* EB3 bit (2 + spi_id); spi2 is bit 4. */
+	{AX620X_PCLK_SPI_M2_EB, "pclk_spi_m2_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0x10, 4, 1, 0, 0, 0, 0,},
 };
 
 static struct axera_divider_clock ax620x_div_clks_periph[] __initdata = {
@@ -543,9 +556,13 @@ static const char *clk_vdec_src_sel[] __initdata = { "cpll_208m", "cpll_312m", "
 static const char *clk_jenc_src_sel[] __initdata = { "cpll_208m", "cpll_312m", "epll_375m", "cpll_416m", "epll_500m", "npll_533m" };
 
 static struct axera_mux_clock ax620x_mux_clks_vpu[] __initdata = {
-	{AX620X_CLK_VPU_GLB_SEL, "clk_vpu_glb_sel", clk_vpu_glb_sel, ARRAY_SIZE(clk_vpu_glb_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 6, 3, 0, NULL,},
-	{AX620X_CLK_VDEC_SRC_SEL, "clk_vdec_src_sel", clk_vdec_src_sel, ARRAY_SIZE(clk_vdec_src_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 3, 3, 0, NULL,},
-	{AX620X_CLK_JENC_SRC_SEL, "clk_jenc_src_sel", clk_jenc_src_sel, ARRAY_SIZE(clk_jenc_src_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 0, 3, 0, NULL,},
+	/*
+	 * No CLK_SET_RATE_PARENT: codec devfreq switches among the fixed
+	 * parents. Propagating would retune cpll/epll/npll.
+	 */
+	{AX620X_CLK_VPU_GLB_SEL, "clk_vpu_glb_sel", clk_vpu_glb_sel, ARRAY_SIZE(clk_vpu_glb_sel), CLK_IGNORE_UNUSED, 0x0, 6, 3, 0, NULL,},
+	{AX620X_CLK_VDEC_SRC_SEL, "clk_vdec_src_sel", clk_vdec_src_sel, ARRAY_SIZE(clk_vdec_src_sel), CLK_IGNORE_UNUSED, 0x0, 3, 3, 0, NULL,},
+	{AX620X_CLK_JENC_SRC_SEL, "clk_jenc_src_sel", clk_jenc_src_sel, ARRAY_SIZE(clk_jenc_src_sel), CLK_IGNORE_UNUSED, 0x0, 0, 3, 0, NULL,},
 };
 
 static struct axera_gate_clock ax620x_gate_clks_vpu[] __initdata = {
