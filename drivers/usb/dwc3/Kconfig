@@ -53,6 +53,14 @@ endchoice
 
 comment "Platform Glue Driver Support"
 
+config USB_DWC3_AXERA
+	tristate "Axera AX620E Platform"
+	depends on (ARCH_AXERA || COMPILE_TEST) && OF
+	default USB_DWC3
+	help
+	  Glue layer that enables AX620E USB2 clocks/resets and populates
+	  the DesignWare USB3 core.
+
 config USB_DWC3_OMAP
 	tristate "Texas Instruments OMAP5 and similar Platforms"
 	depends on ARCH_OMAP2PLUS || COMPILE_TEST
