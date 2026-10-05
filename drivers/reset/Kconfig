@@ -36,6 +36,15 @@ config RESET_ATH79
 	  This enables the ATH79 reset controller driver that supports the
 	  AR71xx SoC reset controller.
 
+config RESET_AXERA
+	tristate "Axera AX620E Reset Driver"
+	depends on ARCH_AXERA || COMPILE_TEST
+	select MFD_SYSCON
+	default ARCH_AXERA
+	help
+	  Reset controller for Axera AX620E / AX630C SoCs. The DT binding
+	  encodes set/clear register offsets in #reset-cells.
+
 config RESET_AXS10X
 	bool "AXS10x Reset Driver" if COMPILE_TEST
 	default ARC_PLAT_AXS10X

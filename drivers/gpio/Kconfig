@@ -188,6 +188,15 @@ config GPIO_ASPEED_SGPIO
 	help
 	  Say Y here to support Aspeed AST2500 SGPIO functionality.
 
+config GPIO_AXERA
+	tristate "Axera AX620E GPIO"
+	depends on ARCH_AXERA || COMPILE_TEST
+	depends on OF_GPIO && HAS_IOMEM
+	select GPIOLIB_IRQCHIP
+	default ARCH_AXERA
+	help
+	  GPIO driver for Axera AX620E / AX630C SoCs.
+
 config GPIO_ATH79
 	tristate "Atheros AR71XX/AR724X/AR913X GPIO support"
 	default y if ATH79
