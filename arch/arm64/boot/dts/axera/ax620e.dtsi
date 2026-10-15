@@ -17,6 +17,8 @@
 		ethernet0 = &eth0;
 		serial0 = &uart0;
 		mmc0 = &emmc;
+		i2c0 = &i2c0;
+		i2c7 = &i2c7;
 	};
 
 	cpus {
@@ -234,6 +236,17 @@
 			#reset-cells = <3>;
 		};
 
+		dphytx_syscon: syscon@23f1000 {
+			compatible = "axera,ax620e-dphytx-syscon", "syscon";
+			reg = <0x0 0x023f1000 0x0 0x1000>;
+		};
+
+		dispc_reset_ext: reset-controller@4600000 {
+			compatible = "axera,axera_reset_match", "syscon";
+			reg = <0x0 0x04600000 0x0 0x100>;
+			#reset-cells = <4>;
+		};
+
 		/* ISP clock/reset window. Capture programs it; nothing writes at map time. */
 		isp_syscon: syscon@2500000 {
 			compatible = "axera,ax630c-isp-syscon", "syscon";
@@ -392,6 +405,9 @@
 			compatible = "axera,ax620e-pinctrl";
 			reg = <0x0 0x02300000 0x0 0xb000>,
 			      <0x0 0x104f0000 0x0 0x3000>;
+			axera,dphytx-syscon = <&dphytx_syscon>;
+			resets = <&dispc_reset_ext 6 0xb8 6 0xbc>;
+			reset-names = "dphytx";
 
 			uart0_txd_pins: uart0-txd-pins {
 				pins = "UART0_TXD";
@@ -447,6 +463,20 @@
 			i2c0_sda_pins: i2c0-sda-pins {
 				pins = "I2C0_SDA";
 				function = "I2C0_SDA";
+				drive-strength = <3>;
+				bias-pull-up;
+			};
+
+			i2c7_scl_pins: i2c7-scl-pins {
+				pins = "VI_D8";
+				function = "I2C7_SCL";
+				drive-strength = <3>;
+				bias-pull-up;
+			};
+
+			i2c7_sda_pins: i2c7-sda-pins {
+				pins = "VI_D9";
+				function = "I2C7_SDA";
 				drive-strength = <3>;
 				bias-pull-up;
 			};
@@ -529,6 +559,25 @@
 			reset-names = "prst", "rst";
 			pinctrl-names = "default";
 			pinctrl-0 = <&i2c0_scl_pins>, <&i2c0_sda_pins>;
+			clock-frequency = <400000>;
+			i2c-sda-hold-time-ns = <500>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c7: i2c@4857000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x0 0x04857000 0x0 0x400>;
+			interrupts = <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_periph AX620X_CLK_I2C_MST7_EB>,
+				 <&clk_periph AX620X_PCLK_I2C_MST7_EB>;
+			clock-names = "ref", "pclk";
+			resets = <&periph_reset_ext 0 0xe0 0 0xe4>,
+				 <&periph_reset_ext 1 0xe0 1 0xe4>;
+			reset-names = "prst", "rst";
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c7_scl_pins>, <&i2c7_sda_pins>;
 			clock-frequency = <400000>;
 			i2c-sda-hold-time-ns = <500>;
 			#address-cells = <1>;

@@ -9,6 +9,8 @@ config PINCTRL_AXERA
 	select GENERIC_PINCONF
 	select GENERIC_PINCTRL_GROUPS
 	select GENERIC_PINMUX_FUNCTIONS
+	select MFD_SYSCON
+	select RESET_CONTROLLER
 	help
 	  This enables the Axera pin controller core.
 

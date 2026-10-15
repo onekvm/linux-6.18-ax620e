@@ -27,3 +27,9 @@
 	status = "disabled";
 	/delete-node/ panel@1;
 };
+
+/* PCIe has an OLED, not the Desk LCD/touch assembly. */
+&i2c7 {
+	status = "disabled";
+	/delete-node/ touchscreen@15;
+};

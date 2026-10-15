@@ -11,6 +11,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
+#include <linux/input/touchscreen.h>
 #include <linux/unaligned.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -29,6 +30,7 @@ struct cst816x_priv {
 	struct i2c_client *client;
 	struct gpio_desc *reset;
 	struct input_dev *input;
+	struct touchscreen_properties prop;
 	unsigned int keycode[CST816X_NUM_KEYS];
 	unsigned int keycodemax;
 };
@@ -141,6 +143,8 @@ static int cst816x_register_input(struct cst816x_priv *priv)
 
 	input_set_abs_params(priv->input, ABS_X, 0, 240, 0, 0);
 	input_set_abs_params(priv->input, ABS_Y, 0, 240, 0, 0);
+	touchscreen_parse_properties(priv->input, false, &priv->prop);
+	__set_bit(INPUT_PROP_DIRECT, priv->input->propbit);
 	input_set_capability(priv->input, EV_KEY, BTN_TOUCH);
 
 	priv->input->keycode = priv->keycode;
@@ -173,15 +177,19 @@ static irqreturn_t cst816x_irq_cb(int irq, void *cookie)
 	if (!cst816x_process_touch(priv, &tch))
 		return IRQ_HANDLED;
 
-	input_report_abs(priv->input, ABS_X, tch.abs_x);
-	input_report_abs(priv->input, ABS_Y, tch.abs_y);
+	touchscreen_report_pos(priv->input, &priv->prop, tch.abs_x, tch.abs_y,
+			       false);
 
-	if (tch.gest)
-		input_report_key(priv->input,
-				 priv->keycode[cst816x_gest_idx(tch.gest)],
-				 tch.active);
+	if (tch.gest) {
+		u8 index = cst816x_gest_idx(tch.gest);
 
-	input_report_key(priv->input, BTN_TOUCH, tch.active);
+		if (index < priv->keycodemax &&
+		    priv->keycode[index] != KEY_RESERVED)
+			input_report_key(priv->input, priv->keycode[index],
+					 !!tch.active);
+	}
+
+	input_report_key(priv->input, BTN_TOUCH, !!tch.active);
 
 	input_sync(priv->input);
 
@@ -226,12 +234,14 @@ static int cst816x_probe(struct i2c_client *client)
 }
 
 static const struct i2c_device_id cst816x_id[] = {
+	{ .name = "cst816d", 0 },
 	{ .name = "cst816s", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, cst816x_id);
 
 static const struct of_device_id cst816x_of_match[] = {
+	{ .compatible = "hynitron,cst816d", },
 	{ .compatible = "hynitron,cst816s", },
 	{ }
 };

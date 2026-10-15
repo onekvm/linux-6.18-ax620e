@@ -6,6 +6,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pinctrl/pinconf.h>
@@ -13,6 +14,8 @@
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/pinctrl/pinmux.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
+#include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -23,11 +26,15 @@
 #include "pinctrl-axera.h"
 #include "pinctrl-ax620e.h"
 
+#define AX_DPHYTX_MIPI_EN	0x10c
+
 struct ax_pinctrl {
 	struct pinctrl_dev *pctldev;
 	struct device *dev;
 	void __iomem *base;
 	void __iomem *base2;
+	struct regmap *dphytx;
+	struct reset_control *dphytx_reset;
 	spinlock_t lock;
 	struct axera_pinctrl_soc_info *info;
 };
@@ -73,6 +80,7 @@ static int ax_set_mux(struct pinctrl_dev *pctldev, unsigned int func_selector,
 	const struct function_desc *func;
 	struct axera_mux_desc *mux;
 	unsigned long flags;
+	int ret;
 	u32 val;
 
 	if (!data)
@@ -88,6 +96,24 @@ static int ax_set_mux(struct pinctrl_dev *pctldev, unsigned int func_selector,
 	}
 	if (!mux->name)
 		return -EINVAL;
+
+	/*
+	 * CDTX pads bypass the ordinary mux while the MIPI transmitter is
+	 * enabled. Follow the AX620E SDK sequence before selecting a digital
+	 * function: hold D-PHY TX in reset, disable MIPI, then program the pad.
+	 * Do not change the PHY for unrelated pads or its native function.
+	 */
+	if (data->offset >= CDTX_L0N_OFFSET &&
+	    data->offset <= CDTX_L4P_OFFSET && mux->muxval) {
+		if (!axpctl->dphytx || !axpctl->dphytx_reset)
+			return -ENODEV;
+		ret = reset_control_assert(axpctl->dphytx_reset);
+		if (ret)
+			return ret;
+		ret = regmap_write(axpctl->dphytx, AX_DPHYTX_MIPI_EN, 0);
+		if (ret)
+			return ret;
+	}
 
 	spin_lock_irqsave(&axpctl->lock, flags);
 	val = ax_pinctrl_readl(axpctl, data->offset);
@@ -264,6 +290,17 @@ int axera_pinctrl_init(struct platform_device *pdev,
 	axpctl->base2 = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(axpctl->base2))
 		return PTR_ERR(axpctl->base2);
+
+	axpctl->dphytx = syscon_regmap_lookup_by_phandle_optional(
+		pdev->dev.of_node, "axera,dphytx-syscon");
+	if (IS_ERR(axpctl->dphytx))
+		return dev_err_probe(&pdev->dev, PTR_ERR(axpctl->dphytx),
+				     "failed to get D-PHY TX syscon\n");
+	axpctl->dphytx_reset = devm_reset_control_get_optional_exclusive(
+		&pdev->dev, "dphytx");
+	if (IS_ERR(axpctl->dphytx_reset))
+		return dev_err_probe(&pdev->dev, PTR_ERR(axpctl->dphytx_reset),
+				     "failed to get D-PHY TX reset\n");
 
 	axpctl->dev = &pdev->dev;
 	axpctl->info = info;

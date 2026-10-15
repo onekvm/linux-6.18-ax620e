@@ -304,7 +304,35 @@
 	};
 };
 
+/* Desk touch panel: vendor CST8xxT firmware targets the CST816D (0xb6). */
+&i2c7 {
+	status = "okay";
+
+	touchscreen@15 {
+		compatible = "hynitron,cst816d";
+		reg = <0x15>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&touch_irq_pins>, <&touch_reset_pins>;
+		interrupt-parent = <&gpio2>;
+		interrupts = <15 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&gpio2 14 GPIO_ACTIVE_LOW>;
+		touchscreen-size-x = <172>;
+		touchscreen-size-y = <320>;
+	};
+};
+
 &pinctrl {
+	touch_irq_pins: touch-irq-pins {
+		pins = "CDTX_L2P";
+		function = "GPIO2_A15";
+		bias-pull-up;
+	};
+
+	touch_reset_pins: touch-reset-pins {
+		pins = "CDTX_L2N";
+		function = "GPIO2_A14";
+	};
+
 	lt6911_int_pins: lt6911-int-pins {
 		pins = "EPHY_LED0";
 		function = "GPIO1_A28";

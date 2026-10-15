@@ -13,9 +13,13 @@ description: |
   Bindings for CST816x high performance self-capacitance touch chip series
   with single point gesture and real two-point operation.
 
+allOf:
+  - $ref: touchscreen.yaml#
+
 properties:
   compatible:
     enum:
+      - hynitron,cst816d
       - hynitron,cst816s
 
   reg:
@@ -41,7 +45,7 @@ required:
   - reg
   - interrupts
 
-additionalProperties: false
+unevaluatedProperties: false
 
 examples:
   - |

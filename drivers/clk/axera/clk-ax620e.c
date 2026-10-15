@@ -517,6 +517,7 @@ static struct axera_gate_clock ax620x_gate_clks_periph[] __initdata = {
 	{AX620X_CLK_I2S_AUDIO_REF_EB, "clk_i2s_audio_ref_eb", "hpll_12p288m", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 3, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_TIMER0_EB, "clk_timer0_eb", "clk_timer_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x8, 31, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_I2C_MST0_EB, "clk_i2c_mst0_eb", "clk_i2c_eb", CLK_SET_RATE_PARENT, 0x8, 8, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_I2C_MST7_EB, "clk_i2c_mst7_eb", "clk_i2c_eb", CLK_SET_RATE_PARENT, 0x8, 15, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_LPC_PERI_EB, "clk_lpc_peri_eb", "cpll_24m", CLK_SET_RATE_PARENT, 0x8, 18, 1, 0, 0, 0, 0,},
 	{AX620X_ACLK_AX_DMA_PER_EB, "aclk_ax_dma_per_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x8, 0, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_I2S_TDM_S_EB, "pclk_i2s_tdm_s_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0xC, 30, 1, 0, 0, 0, 0,},
@@ -525,6 +526,7 @@ static struct axera_gate_clock ax620x_gate_clks_periph[] __initdata = {
 	{AX620X_PCLK_I2S_M_EB, "pclk_i2s_m_eb", "pclk_top_sel", CLK_SET_RATE_PARENT , 0xC, 27, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_AX_DMA_PER_EB, "pclk_ax_dma_per_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0xC, 11, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_I2C_MST0_EB, "pclk_i2c_mst0_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0xC, 17, 1, 0, 0, 0, 0,},
+	{AX620X_PCLK_I2C_MST7_EB, "pclk_i2c_mst7_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0xC, 24, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_TIMER0_EB, "pclk_timer0_eb", "pclk_top_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x10, 5, 1, 0, 0, 0, 0,},
 	/* EB3 bit (2 + spi_id); spi2 is bit 4. */
 	{AX620X_PCLK_SPI_M2_EB, "pclk_spi_m2_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0x10, 4, 1, 0, 0, 0, 0,},
