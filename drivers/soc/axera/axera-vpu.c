@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 
 struct axera_vpu {
@@ -36,7 +37,12 @@ static ssize_t regs_show(struct device *dev, struct device_attribute *attr,
 {
 	struct axera_vpu *vpu = dev_get_drvdata(dev);
 	u32 w0, w1, w2, w3, c0, c1;
+	int ret;
+	ssize_t len;
 
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
 	w0 = readl_relaxed(vpu->base + 0x0);
 	w1 = readl_relaxed(vpu->base + 0x4);
 	w2 = readl_relaxed(vpu->base + 0x8);
@@ -44,8 +50,11 @@ static ssize_t regs_show(struct device *dev, struct device_attribute *attr,
 	/* Public VC8000 VCMD puts the encoder core at 0x1000. */
 	c0 = readl_relaxed(vpu->base + 0x1000);
 	c1 = readl_relaxed(vpu->base + 0x1004);
-	return sysfs_emit(buf, "0000: %08x %08x %08x %08x\n1000: %08x %08x\n",
-			   w0, w1, w2, w3, c0, c1);
+	len = sysfs_emit(buf, "0000: %08x %08x %08x %08x\n1000: %08x %08x\n",
+			 w0, w1, w2, w3, c0, c1);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+	return len;
 }
 static DEVICE_ATTR_RO(regs);
 
@@ -71,7 +80,12 @@ static ssize_t rate_store(struct device *dev, struct device_attribute *attr,
 	if (ret)
 		return ret;
 
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
 	ret = dev_pm_opp_set_rate(dev, rate);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 	if (ret)
 		return ret;
 
@@ -114,6 +128,29 @@ static const struct attribute_group axera_vpu_group = {
 	.attrs = axera_vpu_attrs,
 };
 
+static int axera_vpu_runtime_suspend(struct device *dev)
+{
+	struct axera_vpu *vpu = dev_get_drvdata(dev);
+
+	/*
+	 * This diagnostic driver submits no jobs. Only register/rate accesses
+	 * need a clock; preserve reset and register state across idle periods.
+	 */
+	clk_disable_unprepare(vpu->clk);
+	return 0;
+}
+
+static int axera_vpu_runtime_resume(struct device *dev)
+{
+	struct axera_vpu *vpu = dev_get_drvdata(dev);
+
+	return clk_prepare_enable(vpu->clk);
+}
+
+static const struct dev_pm_ops axera_vpu_pm_ops = {
+	RUNTIME_PM_OPS(axera_vpu_runtime_suspend, axera_vpu_runtime_resume, NULL)
+};
+
 static int axera_vpu_probe(struct platform_device *pdev)
 {
 	struct axera_vpu *vpu;
@@ -153,8 +190,17 @@ static int axera_vpu_probe(struct platform_device *pdev)
 		vpu->opp = true;
 
 	platform_set_drvdata(pdev, vpu);
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_get_noresume(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
+	pm_runtime_use_autosuspend(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
 	ret = device_add_group(&pdev->dev, &axera_vpu_group);
 	if (ret) {
+		pm_runtime_disable(&pdev->dev);
+		pm_runtime_put_noidle(&pdev->dev);
+		pm_runtime_dont_use_autosuspend(&pdev->dev);
+		pm_runtime_set_suspended(&pdev->dev);
 		reset_control_assert(vpu->rst);
 		clk_disable_unprepare(vpu->clk);
 		return ret;
@@ -164,16 +210,26 @@ static int axera_vpu_probe(struct platform_device *pdev)
 	date = readl(vpu->base + 4);
 	dev_info(&pdev->dev, "hwid %08x %08x, clock %lu Hz, reset deasserted\n",
 		 hwid, date, clk_get_rate(vpu->clk));
+	pm_runtime_mark_last_busy(&pdev->dev);
+	pm_runtime_put_autosuspend(&pdev->dev);
 	return 0;
 }
 
 static void axera_vpu_remove(struct platform_device *pdev)
 {
 	struct axera_vpu *vpu = platform_get_drvdata(pdev);
+	int ret;
 
 	device_remove_group(&pdev->dev, &axera_vpu_group);
-	reset_control_assert(vpu->rst);
-	clk_disable_unprepare(vpu->clk);
+	ret = pm_runtime_resume_and_get(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	if (ret >= 0) {
+		reset_control_assert(vpu->rst);
+		clk_disable_unprepare(vpu->clk);
+		pm_runtime_put_noidle(&pdev->dev);
+	}
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
 }
 
 static const struct of_device_id axera_vpu_of_match[] = {
@@ -189,6 +245,7 @@ static struct platform_driver axera_vpu_driver = {
 	.driver = {
 		.name = "axera-vpu",
 		.of_match_table = axera_vpu_of_match,
+		.pm = pm_ptr(&axera_vpu_pm_ops),
 	},
 };
 module_platform_driver(axera_vpu_driver);

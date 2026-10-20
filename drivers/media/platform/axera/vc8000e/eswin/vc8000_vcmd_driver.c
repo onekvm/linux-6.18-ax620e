@@ -1580,9 +1580,8 @@ static long release_cmdbuf(struct file *filp, u16 cmdbuf_id)
 		struct filp_priv *fp_priv = (struct filp_priv *)filp->private_data;
 
 		/** release for the pm*/
-		if (atomic_dec_return(&(fp_priv->core_tasks[dev->core_id])) >= 0) {
+		if (atomic_dec_if_positive(&(fp_priv->core_tasks[dev->core_id])) >= 0)
 			enc_pm_runtime_put(dev->core_id);
-		}
 	}
 
 	return 0;
@@ -2608,6 +2607,15 @@ static int hantrovcmd_open(struct inode *inode, struct file *filp)
 		pr_err("%s: alloc failed\n", __func__);
 		return -ENOMEM;
 	}
+	/*
+	 * AX630C: keep register access and async DMA powered until final close,
+	 * including the lifetime of VMAs that retain this file.
+	 */
+	result = enc_pm_runtime_get(0);
+	if (result < 0) {
+		kfree(fp_priv);
+		return result;
+	}
 #ifdef SUPPORT_DMA_HEAP
 		common_dmabuf_heap_import_init(&fp_priv->root, &venc_pdev->dev);
 	if (venc_pdev_d1) {
@@ -2622,6 +2630,7 @@ static int hantrovcmd_open(struct inode *inode, struct file *filp)
 	process_manager_node = create_process_manager_node();
 	if (!process_manager_node) {
 		kfree(fp_priv);
+		enc_pm_runtime_put(0);
 		return -1;
 	}
 	process_manager_obj =
@@ -3008,9 +3017,8 @@ static int hantrovcmd_release(struct inode *inode, struct file *filp)
 		/** clear the tasks for pm*/
 		int n = atomic_xchg(&(fp_priv->core_tasks[core_id]), 0);
 
-		while (n --) {
+		while (n-- > 0)
 			enc_pm_runtime_put(core_id);
-		}
 	}
 #ifdef SUPPORT_DMA_HEAP
 	if (venc_pdev_d1) {
@@ -3021,9 +3029,16 @@ static int hantrovcmd_release(struct inode *inode, struct file *filp)
 #endif
 	vcmd_fb_release_filp(filp);  /* AX630C-PORT: drop this file's frame buffers (#45) */
 	kfree(fp_priv);
+	/* Abort/delink, buffer release and any pending ISR precede autosuspend. */
+	enc_pm_runtime_put(0);
 	return 0;
 
 error:
+	/*
+	 * A failed abort may leave DMA live. Retain power rather than gating a
+	 * running command engine; recovery requires resetting the device.
+	 */
+	LOG_ERR("VCMD close failed; retaining runtime power for unfinished DMA\n");
 #ifdef SUPPORT_DMA_HEAP
 	if (venc_pdev_d1) {
 		common_dmabuf_heap_rsv_iova_uninit(&fp_priv->root_d1);
@@ -4083,7 +4098,7 @@ err1:
 	return result;
 }
 
-void hantroenc_vcmd_exit(void)
+static void hantroenc_vcmd_exit(bool powered)
 {
 	int i = 0;
 	u32 result;
@@ -4093,18 +4108,20 @@ void hantroenc_vcmd_exit(void)
 	for (i = 0; i < venc_vcmd_core_num; i++) {
 		if (!hantrovcmd_data[i].hwregs)
 			continue;
-		//disable interrupt at first
-		vcmd_write_reg((const void *)hantrovcmd_data[i].hwregs,
-			       VCMD_REGISTER_INT_CTL_OFFSET, 0x0000);
-		//disable HW
-		vcmd_write_reg((const void *)hantrovcmd_data[i].hwregs,
-			       VCMD_REGISTER_CONTROL_OFFSET, 0x0000);
-		//read status register
-		result = vcmd_read_reg((const void *)hantrovcmd_data[i].hwregs,
-				       VCMD_REGISTER_INT_STATUS_OFFSET);
-		//clean status register
-		vcmd_write_reg((const void *)hantrovcmd_data[i].hwregs,
-			       VCMD_REGISTER_INT_STATUS_OFFSET, result);
+		if (powered) {
+			//disable interrupt at first
+			vcmd_write_reg((const void *)hantrovcmd_data[i].hwregs,
+				       VCMD_REGISTER_INT_CTL_OFFSET, 0x0000);
+			//disable HW
+			vcmd_write_reg((const void *)hantrovcmd_data[i].hwregs,
+				       VCMD_REGISTER_CONTROL_OFFSET, 0x0000);
+			//read status register
+			result = vcmd_read_reg((const void *)hantrovcmd_data[i].hwregs,
+					       VCMD_REGISTER_INT_STATUS_OFFSET);
+			//clean status register
+			vcmd_write_reg((const void *)hantrovcmd_data[i].hwregs,
+				       VCMD_REGISTER_INT_STATUS_OFFSET, result);
+		}
 
 		/* free the vcmd IRQ */
 		if (hantrovcmd_data[i].vcmd_core_cfg.vcmd_irq != -1) {
@@ -4822,9 +4839,9 @@ int vc8000e_vcmd_init(void)
 	return hantroenc_vcmd_init();
 }
 
-int vc8000e_vcmd_cleanup(void)
+int vc8000e_vcmd_cleanup(bool powered)
 {
-	hantroenc_vcmd_exit();
+	hantroenc_vcmd_exit(powered);
 	vcmd_mem_cleanup();
 
 	return 0;

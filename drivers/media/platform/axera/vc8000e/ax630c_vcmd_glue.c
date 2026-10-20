@@ -42,11 +42,13 @@
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
 
@@ -63,16 +65,28 @@ extern int venc_vcmd_core_num;			/* defined in the VCMD core */
 extern struct vcmd_config vc8000e_vcmd_core_array[];	/* via vc8000_vcmd_cfg.h */
 
 int vc8000e_vcmd_init(void);			/* vcmd_mem_init() + hantroenc_vcmd_init() */
-int vc8000e_vcmd_cleanup(void);
+int vc8000e_vcmd_cleanup(bool powered);
 
 /*
- * PM / reset hooks the core calls per core_id. The block's clock and reset are
- * held for the driver's lifetime (the vendor stack gated the clock around each
- * encode from userspace; there is nothing to gain from that here and a gated
- * block reads 0xDEADBEEF), so these stay no-ops.
+ * Hold power for every open file as well as submitted commands. The file
+ * reference covers ioctls, mapped pools and close-time abort/register access;
+ * task references alone do not cover those paths. Gate only after the final
+ * close has drained its commands, never between frames of a live stream.
  */
-int enc_pm_runtime_get(u32 core_id) { (void)core_id; return 0; }
-int enc_pm_runtime_put(u32 core_id) { (void)core_id; return 0; }
+int enc_pm_runtime_get(u32 core_id)
+{
+	if (core_id || !venc_pdev)
+		return -ENODEV;
+	return pm_runtime_resume_and_get(&venc_pdev->dev);
+}
+
+int enc_pm_runtime_put(u32 core_id)
+{
+	if (core_id || !venc_pdev)
+		return -ENODEV;
+	pm_runtime_mark_last_busy(&venc_pdev->dev);
+	return pm_runtime_put_autosuspend(&venc_pdev->dev);
+}
 int enc_reset_system(u32 core_id)   { (void)core_id; return 0; }
 EXPORT_SYMBOL(enc_pm_runtime_get);
 EXPORT_SYMBOL(enc_pm_runtime_put);
@@ -81,6 +95,35 @@ EXPORT_SYMBOL(enc_reset_system);
 struct ax630c_vcmd {
 	struct clk *clk;
 	struct reset_control *rst;
+	int irq;
+};
+
+static int ax630c_vcmd_runtime_suspend(struct device *dev)
+{
+	struct ax630c_vcmd *vc = dev_get_drvdata(dev);
+
+	/* No file/command references remain. Drain a late ISR before gating. */
+	disable_irq(vc->irq);
+	clk_disable_unprepare(vc->clk);
+	return 0;
+}
+
+static int ax630c_vcmd_runtime_resume(struct device *dev)
+{
+	struct ax630c_vcmd *vc = dev_get_drvdata(dev);
+	int ret;
+
+	/* Keep reset deasserted: VCMD queue/register state survives gating. */
+	ret = clk_prepare_enable(vc->clk);
+	if (ret)
+		return ret;
+	enable_irq(vc->irq);
+	return 0;
+}
+
+static const struct dev_pm_ops ax630c_vcmd_pm_ops = {
+	RUNTIME_PM_OPS(ax630c_vcmd_runtime_suspend,
+		       ax630c_vcmd_runtime_resume, NULL)
 };
 
 static int ax630c_vcmd_probe(struct platform_device *pdev)
@@ -111,6 +154,7 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	vc->irq = irq;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
@@ -172,6 +216,11 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, vc);
+	pm_runtime_set_active(dev);
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_autosuspend_delay(dev, 1000);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
 	venc_pdev = pdev;
 	vcmd_fb_set_dev(dev);	/* dma-buf imports attach here (#60) */
 
@@ -188,9 +237,15 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 
 	dev_info(dev, "VC8000E VCMD engine up (base %pa, irq %d)\n",
 		 &res->start, irq);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 	return 0;
 
 err_reset:
+	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_set_suspended(dev);
 	venc_pdev = NULL;
 	vcmd_fb_set_dev(NULL);
 	/*
@@ -208,11 +263,22 @@ static void ax630c_vcmd_remove(struct platform_device *pdev)
 {
 	struct ax630c_vcmd *vc = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
+	int ret;
 
-	vc8000e_vcmd_cleanup();
+	/* cleanup touches registers even when the last viewer left long ago. */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		dev_err(dev, "cannot resume VCMD for removal: %d\n", ret);
+	pm_runtime_disable(dev);
+	vc8000e_vcmd_cleanup(ret >= 0);
 	vcmd_fb_set_dev(NULL);
 	venc_pdev = NULL;
-	clk_disable_unprepare(vc->clk);
+	if (ret >= 0) {
+		clk_disable_unprepare(vc->clk);
+		pm_runtime_put_noidle(dev);
+	}
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_set_suspended(dev);
 	of_reserved_mem_device_release(dev);
 }
 
@@ -227,6 +293,7 @@ static struct platform_driver ax630c_vcmd_driver = {
 	.remove = ax630c_vcmd_remove,
 	.driver = {
 		.name = "ax630c-venc-vcmd",
+		.pm = pm_ptr(&ax630c_vcmd_pm_ops),
 		.of_match_table = ax630c_vcmd_of_match,
 	},
 };
