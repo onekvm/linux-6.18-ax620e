@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/axera,ax630c-vdec.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Axera AX630C Hantro G1 video decoder
+
+maintainers:
+  - OneKVM maintainers <dev@onekvm.org>
+
+description: |
+  Hantro G1 H.264 decoder exposed through V4L2 stateless decoding and the
+  Media Request API. The peripheral has a private clock and reset; VIN,
+  VENC and the shared CDMA domains are managed independently.
+
+properties:
+  compatible:
+    const: axera,ax630c-vdec
+  reg:
+    maxItems: 1
+  reg-names:
+    items:
+      - const: ax_vdec
+  interrupts:
+    maxItems: 1
+  clocks:
+    maxItems: 1
+  clock-names:
+    items:
+      - const: vdec_clk
+  resets:
+    maxItems: 1
+  reset-names:
+    items:
+      - const: vdec_rst
+  operating-points-v2: true
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - resets
+
+additionalProperties: false

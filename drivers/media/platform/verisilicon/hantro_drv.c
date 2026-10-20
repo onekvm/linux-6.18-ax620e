@@ -215,13 +215,24 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	 * for faster allocation. Also, no CPU access on the source queue,
 	 * so no kernel mapping needed.
 	 */
-	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
-			    DMA_ATTR_NO_KERNEL_MAPPING;
+	/*
+	 * V4L2_MEMORY_FLAG_NON_COHERENT uses videobuf2's non-contiguous DMA
+	 * allocator.  Its dma_alloc_noncontiguous() contract accepts only
+	 * DMA_ATTR_ALLOC_SINGLE_PAGES; keeping NO_KERNEL_MAPPING here makes the
+	 * allocator pass an unsupported attribute and fail every capture buffer.
+	 * The non-coherent path creates its mapping lazily when the buffer is
+	 * accessed, so the old optimization is unnecessary.
+	 */
+	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
 	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->dev->vpu_mutex;
 	src_vq->dev = ctx->dev->v4l2_dev.dev;
 	src_vq->supports_requests = true;
+	/* Allow standard cacheable MMAP allocations. Videobuf2 synchronizes
+	 * CPU/device ownership; userspace must opt in through REQBUFS flags.
+	 */
+	src_vq->allow_cache_hints = true;
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
@@ -235,7 +246,6 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	 * JPEG encoder to fill in the JPEG headers.
 	 */
 	if (!ctx->is_encoder) {
-		dst_vq->dma_attrs |= DMA_ATTR_NO_KERNEL_MAPPING;
 		dst_vq->max_num_buffers = MAX_POSTPROC_BUFFERS;
 	}
 
@@ -247,6 +257,7 @@ queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->dev->vpu_mutex;
 	dst_vq->dev = ctx->dev->v4l2_dev.dev;
+	dst_vq->allow_cache_hints = true;
 
 	return vb2_queue_init(dst_vq);
 }
@@ -710,6 +721,11 @@ static const struct v4l2_file_operations hantro_fops = {
 };
 
 static const struct of_device_id of_hantro_match[] = {
+#ifdef CONFIG_VIDEO_HANTRO_AX630C
+	{ .compatible = "axera,ax630c-vdec", .data = &ax630c_vdec_variant, },
+	/* Compatibility with OneKVM kernels predating the V4L2 decoder. */
+	{ .compatible = "axera, video-decoder", .data = &ax630c_vdec_variant, },
+#endif
 #ifdef CONFIG_VIDEO_HANTRO_ROCKCHIP
 	{ .compatible = "rockchip,px30-vpu",   .data = &px30_vpu_variant, },
 	{ .compatible = "rockchip,rk3036-vpu", .data = &rk3036_vpu_variant, },

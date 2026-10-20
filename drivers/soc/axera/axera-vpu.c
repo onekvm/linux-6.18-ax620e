@@ -179,7 +179,6 @@ static void axera_vpu_remove(struct platform_device *pdev)
 static const struct of_device_id axera_vpu_of_match[] = {
 	{ .compatible = "axera, venc-encoder" },
 	{ .compatible = "axera,jpeg-encoder" },
-	{ .compatible = "axera, video-decoder" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, axera_vpu_of_match);

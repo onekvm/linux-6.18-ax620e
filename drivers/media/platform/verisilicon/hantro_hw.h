@@ -403,6 +403,7 @@ enum hantro_enc_fmt {
 };
 
 extern const struct hantro_variant imx8mm_vpu_g1_variant;
+extern const struct hantro_variant ax630c_vdec_variant;
 extern const struct hantro_variant imx8mq_vpu_g1_variant;
 extern const struct hantro_variant imx8mq_vpu_g2_variant;
 extern const struct hantro_variant imx8mq_vpu_variant;

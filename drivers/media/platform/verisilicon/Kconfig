@@ -4,7 +4,7 @@ comment "Verisilicon media platform drivers"
 
 config VIDEO_HANTRO
 	tristate "Hantro VPU driver"
-	depends on ARCH_MXC || ARCH_ROCKCHIP || ARCH_AT91 || ARCH_SUNXI || ARCH_STM32 || COMPILE_TEST
+	depends on ARCH_AXERA || ARCH_MXC || ARCH_ROCKCHIP || ARCH_AT91 || ARCH_SUNXI || ARCH_STM32 || COMPILE_TEST
 	depends on V4L_MEM2MEM_DRIVERS
 	depends on VIDEO_DEV
 	select MEDIA_CONTROLLER
@@ -28,6 +28,14 @@ config VIDEO_HANTRO_HEVC_RFC
 	help
 	  Enable the reference frame compression feature for the HEVC codec.
 	  It will use more memory but save bandwidth on memory bus.
+
+config VIDEO_HANTRO_AX630C
+	bool "Hantro G1 AX630C support"
+	depends on VIDEO_HANTRO
+	depends on ARCH_AXERA || COMPILE_TEST
+	default y
+	help
+	  Stateless H.264 decoding on Axera AX630C using the V4L2 Request API.
 
 config VIDEO_HANTRO_IMX8M
 	bool "Hantro VPU i.MX8M support"

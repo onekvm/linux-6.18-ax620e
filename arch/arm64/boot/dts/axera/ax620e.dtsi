@@ -383,7 +383,7 @@
 		};
 
 		vdec: vdec@4020000 {
-			compatible = "axera, video-decoder";
+			compatible = "axera,ax630c-vdec";
 			reg = <0x0 0x04020000 0x0 0x10000>;
 			reg-names = "ax_vdec";
 			interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH>;
