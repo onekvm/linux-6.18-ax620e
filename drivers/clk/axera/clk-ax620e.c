@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-onlystatic const char *clk_ce_bus_sel[] __initdata = { "cpll_24m", "cpll_208m", "cpll_312m", "cpll_416m" };
+
 /*
  * Axera AX620X clock driver
  *
@@ -498,6 +499,7 @@ static const char *clk_spi_m_sel[] __initdata = { "cpll_24m", "epll_50m", "cpll_
 static const char *clk_i2c_sel[] __initdata = { "cpll_24m", "epll_50m", "cpll_156m", "cpll_208m" };
 
 static struct axera_mux_clock ax620x_mux_clks_periph[] __initdata = {
+	{AX620X_CLK_CE_BUS_SEL, "clk_ce_bus_sel", clk_ce_bus_sel, ARRAY_SIZE(clk_ce_bus_sel), 0, 0x0, 0, 2, 0, NULL,},
 	{AX620X_SCLK_I2S_TDM_SEL, "sclk_i2s_tdm_sel", sclk_i2s_tdm_sel, ARRAY_SIZE(sclk_i2s_tdm_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 23, 2, 0, NULL,},
 	{AX620X_SCLK_I2S_M_SEL, "sclk_i2s_m_sel", sclk_i2s_m_sel, ARRAY_SIZE(sclk_i2s_m_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 21, 2, 0, NULL,},
 	{AX620X_CLK_TIMER_SEL, "clk_timer_sel", clk_timer_sel, ARRAY_SIZE(clk_timer_sel), CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x0, 13, 1, 0, NULL,},
@@ -507,6 +509,9 @@ static struct axera_mux_clock ax620x_mux_clks_periph[] __initdata = {
 };
 
 static struct axera_gate_clock ax620x_gate_clks_periph[] __initdata = {
+	{AX620X_CLK_CE_CNT_EB, "clk_ce_cnt_eb", "cpll_24m", 0, 0x4, 0, 1, 0, 0, 0, 0,},
+	{AX620X_ACLK_CE_EB, "aclk_ce_eb", "clk_ce_bus_sel", 0, 0x8, 1, 1, 0, 0, 0, 0,},
+	{AX620X_PCLK_CE_EB, "pclk_ce_eb", "pclk_top_sel", 0, 0xC, 12, 1, 0, 0, 0, 0,},
 	{AX620X_SCLK_I2S_TDM_EB, "sclk_i2s_tdm_eb", "sclk_i2s_tdm_divn", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 17, 1, 0, 0, 0, 0,},
 	{AX620X_SCLK_I2S_M_EB, "sclk_i2s_m_eb", "sclk_i2s_m_divn", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 16, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_TIMER_EB, "clk_timer_eb", "clk_timer_sel", CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED, 0x4, 9, 1, 0, 0, 0, 0,},

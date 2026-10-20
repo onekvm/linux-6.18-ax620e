@@ -321,6 +321,10 @@
 	};
 };
 
+&crypto {
+	status = "okay";
+};
+
 &pinctrl {
 	touch_irq_pins: touch-irq-pins {
 		pins = "CDTX_L2P";

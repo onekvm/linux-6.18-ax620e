@@ -265,6 +265,24 @@
 			#clock-cells = <1>;
 		};
 
+		crypto: crypto@4900000 {
+			compatible = "axera,ax630c-eip130";
+			reg = <0x0 0x04900000 0x0 0x40000>;
+			interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_periph AX620X_PCLK_CE_EB>,
+				 <&clk_periph AX620X_ACLK_CE_EB>,
+				 <&clk_periph AX620X_CLK_CE_CNT_EB>;
+			clock-names = "pclk", "core", "cnt";
+			assigned-clocks = <&clk_periph AX620X_CLK_CE_BUS_SEL>;
+			assigned-clock-rates = <312000000>;
+			resets = <&periph_reset_ext 4 0xd8 4 0xdc>,
+				 <&periph_reset_ext 5 0xd8 5 0xdc>,
+				 <&periph_reset_ext 6 0xd8 6 0xdc>,
+				 <&periph_reset_ext 8 0xd8 8 0xdc>,
+				 <&periph_reset_ext 7 0xd8 7 0xdc>;
+			status = "disabled";
+		};
+
 		clk_vpu: clock-controller@4030000 {
 			compatible = "axera,ax620x-vpu-clk", "syscon";
 			reg = <0x0 0x04030000 0x0 0x10000>;
