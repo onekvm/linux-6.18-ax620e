@@ -4,6 +4,7 @@
 #
 
 # The WatchDog Timer Driver Core.
+obj-$(CONFIG_AXERA_WATCHDOG)	+= axera_wdt.o
 obj-$(CONFIG_WATCHDOG_CORE)	+= watchdog.o
 
 watchdog-objs	+= watchdog_core.o watchdog_dev.o

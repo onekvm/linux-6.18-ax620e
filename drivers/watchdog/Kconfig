@@ -30,6 +30,16 @@ menuconfig WATCHDOG
 
 if WATCHDOG
 
+config AXERA_WATCHDOG
+	tristate "Axera AX620E/AX630C watchdog"
+	depends on ARCH_AXERA || COMPILE_TEST
+	depends on OF && COMMON_CLK && RESET_CONTROLLER
+	select WATCHDOG_CORE
+	help
+	  Hardware watchdog for Axera AX620E and AX630C SoCs. Provides the
+	  standard /dev/watchdog interface with timeout, keepalive and magic
+	  close. The hardware resets the system when userspace stops feeding.
+
 config WATCHDOG_CORE
 	tristate "WatchDog Timer Driver Core"
 	help

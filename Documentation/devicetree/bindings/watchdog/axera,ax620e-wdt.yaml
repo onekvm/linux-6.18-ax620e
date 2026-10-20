@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/watchdog/axera,ax620e-wdt.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Axera AX620E and AX630C hardware watchdog
+
+maintainers:
+  - OneKVM maintainers <dev@onekvm.org>
+
+description: |
+  The Axera watchdog has a 32-bit down counter with a 16-bit reload field
+  representing multiples of 65536 reference clock ticks. The first expiry
+  reloads the counter and latches an interrupt; the second resets the system.
+  The driver accounts for both stages in the watchdog timeout. It can use the
+  low frequency RTC clock or the 24 MHz oscillator. The timer and bus have
+  separate clocks and resets. This binding uses hardware reset on expiry;
+  the optional interrupt is not used for automatic keepalive.
+
+allOf:
+  - $ref: watchdog.yaml#
+
+properties:
+  compatible:
+    const: axera,ax620e-wdt
+  reg:
+    maxItems: 1
+  clocks:
+    items:
+      - description: Timer reference clock
+      - description: Peripheral bus clock
+  clock-names:
+    items:
+      - const: tclk
+      - const: pclk
+  resets:
+    items:
+      - description: Timer reset
+      - description: Peripheral bus reset
+  reset-names:
+    items:
+      - const: timer
+      - const: bus
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+unevaluatedProperties: false

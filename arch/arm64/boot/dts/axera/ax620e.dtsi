@@ -265,6 +265,19 @@
 			#clock-cells = <1>;
 		};
 
+		wdt0: watchdog@4840000 {
+			compatible = "axera,ax620e-wdt";
+			reg = <0x0 0x04840000 0x0 0x400>;
+			clocks = <&clk_periph AX620X_CLK_WDT0_EB>,
+				 <&clk_periph AX620X_PCLK_WDT0_EB>;
+			clock-names = "tclk", "pclk";
+			resets = <&periph_reset_ext 1 0xf0 1 0xf4>,
+				 <&periph_reset_ext 0 0xf0 0 0xf4>;
+			reset-names = "timer", "bus";
+			timeout-sec = <60>;
+			status = "disabled";
+		};
+
 		crypto: crypto@4900000 {
 			compatible = "axera,ax630c-eip130";
 			reg = <0x0 0x04900000 0x0 0x40000>;
