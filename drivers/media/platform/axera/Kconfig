@@ -2,6 +2,17 @@
 
 comment "Axera media platform drivers"
 
+config VIDEO_AX630C_TDP
+	tristate "Axera AX630C TDP V4L2 scaler and colour converter"
+	depends on V4L_PLATFORM_DRIVERS && VIDEO_DEV && OF && HAS_DMA
+	select DMA_SHARED_BUFFER
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Standard V4L2 mem2mem YUYV/NV12 to RGB565 conversion and scaling.
+	  Supports reusable MMAP and DMA-BUF queues with crop and colourimetry.
+	  The command engine and main video encoder remain independent.
+
 config VIDEO_AX630C_CSI2RX
 	tristate "Axera AX630C MIPI CSI-2 receiver"
 	depends on V4L_PLATFORM_DRIVERS

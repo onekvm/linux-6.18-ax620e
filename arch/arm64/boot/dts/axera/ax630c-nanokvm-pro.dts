@@ -93,6 +93,10 @@
 	status = "okay";
 };
 
+&tdp {
+	status = "okay";
+};
+
 &wdt0 {
 	status = "okay";
 };

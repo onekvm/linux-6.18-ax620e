@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/axera,ax630c-tdp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Axera AX630C two-dimensional image processor
+
+maintainers:
+  - OneKVM maintainers <dev@onekvm.org>
+
+description: |
+  The TDP scales images and converts their colour space independently of
+  the VIN capture and Hantro video encoder. It has one completion interrupt.
+  CPU register submission does not require the shared CDMA engine clocks
+  or resets. Reset lines are private to the TDP peripheral and core.
+
+properties:
+  compatible:
+    const: axera,ax630c-tdp
+  reg:
+    maxItems: 1
+  interrupts:
+    maxItems: 1
+  clocks:
+    items:
+      - description: TDP core clock
+      - description: TDP peripheral clock
+  clock-names:
+    items:
+      - const: core
+      - const: pclk
+  assigned-clocks:
+    maxItems: 1
+  assigned-clock-rates:
+    maxItems: 1
+  resets:
+    items:
+      - description: TDP peripheral reset
+      - description: TDP core reset
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+
+additionalProperties: false

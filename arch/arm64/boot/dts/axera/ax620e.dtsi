@@ -302,6 +302,30 @@
 			#clock-cells = <1>;
 		};
 
+		clk_mm: clock-controller@4430000 {
+			compatible = "axera,ax620x-mm-clk", "syscon";
+			reg = <0x0 0x04430000 0x0 0x10000>;
+			#clock-cells = <1>;
+		};
+		mm_reset_async: reset-controller@4430000 {
+			compatible = "axera,axera_reset_match", "syscon";
+			reg = <0x0 0x04430000 0x0 0x10000>;
+			#reset-cells = <10>;
+		};
+		tdp: image-processor@4405000 {
+			compatible = "axera,ax630c-tdp";
+			reg = <0x0 0x04405000 0x0 0x1000>;
+			interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_mm AX620X_CLK_TDP_EB>,
+				 <&clk_mm AX620X_PCLK_TDP_EB>;
+			clock-names = "core", "pclk";
+			assigned-clocks = <&clk_mm AX620X_CLK_TDP_SRC_SEL>;
+			assigned-clock-rates = <312000000>;
+			resets = <&mm_reset_async 19 0xc4 19 0xc8 0x8 24 0xb4 24 0xb8 24>,
+				 <&mm_reset_async 20 0xc4 20 0xc8 0x8 11 0xb4 11 0xb8 11>;
+			status = "disabled";
+		};
+
 		cpu_reset_ext: reset-controller@1900000 {
 			compatible = "axera,axera_reset_match", "syscon";
 			reg = <0x0 0x01900000 0x0 0x10000>;
