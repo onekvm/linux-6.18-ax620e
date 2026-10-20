@@ -757,7 +757,14 @@ static int openvin_csi2_log_status(struct v4l2_subdev *sd)
 	last_err1 = priv->last_err1;
 	spin_unlock_irqrestore(&priv->err_lock, flags);
 
+	mutex_lock(&priv->lock);
 	v4l2_info(sd, "streaming: %d\n", priv->streaming);
+	/*
+	 * VIN gates the shared ISP/CSI clock bank while idle. Telemetry must
+	 * not touch the stopped controller or wake capture just for status.
+	 */
+	if (!priv->streaming)
+		goto counters;
 	v4l2_info(sd, "deskew/lock status: 0x%08x (%s)\n",
 		  isp_glb_rd(priv, ISP_GLB_CSIRX_STATUS),
 		  openvin_link_locked(priv) ? "LOCKED" : "not locked");
@@ -765,13 +772,15 @@ static int openvin_csi2_log_status(struct v4l2_subdev *sd)
 		  csi_rd(priv, CSI_CTRL_DPHY_LANE_CONTROL),
 		  csi_rd(priv, CSI_CTRL_STREAM_CFG_LANES),
 		  csi_rd(priv, CSI_CTRL_STREAM_CTRL));
+	v4l2_info(sd, "live ErrorStatus0: 0x%08x, ErrorStatus1: 0x%08x\n",
+		  csi_rd(priv, CSI_CTRL_ERR_STATUS0),
+		  csi_rd(priv, CSI_CTRL_ERR_STATUS1));
+counters:
+	mutex_unlock(&priv->lock);
 	v4l2_info(sd, "error irqs: %llu (status0 events: %llu, status1 events: %llu)\n",
 		  irq_count, err0_events, err1_events);
 	v4l2_info(sd, "last ErrorStatus0: 0x%08x, last ErrorStatus1: 0x%08x\n",
 		  last_err0, last_err1);
-	v4l2_info(sd, "live ErrorStatus0: 0x%08x, ErrorStatus1: 0x%08x\n",
-		  csi_rd(priv, CSI_CTRL_ERR_STATUS0),
-		  csi_rd(priv, CSI_CTRL_ERR_STATUS1));
 
 	return 0;
 }
@@ -870,7 +879,9 @@ static int openvin_csi2_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case OPENVIN_CID_LINK_LOCKED:
-		ctrl->val = openvin_link_locked(priv);
+		mutex_lock(&priv->lock);
+		ctrl->val = priv->streaming && openvin_link_locked(priv);
+		mutex_unlock(&priv->lock);
 		return 0;
 	case OPENVIN_CID_ERR0_EVENTS:
 		spin_lock_irqsave(&priv->err_lock, flags);

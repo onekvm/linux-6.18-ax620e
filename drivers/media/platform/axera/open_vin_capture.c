@@ -54,6 +54,7 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/iosys-map.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -62,6 +63,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
+#include <linux/pm_runtime.h>
 #include <linux/videodev2.h>
 
 #include <media/v4l2-device.h>
@@ -244,7 +246,11 @@ MODULE_PARM_DESC(wdma_chn, "IFE-WDMA channel for the packed YUV422 plane");
  */
 #define OVC_CLK_MUX_FIELDS	0x7fc
 #define OVC_CLK_GATE_A_SET	0xD0	/* bits [5:0] */
+#define OVC_CLK_GATE_A_CLR	0xD4
 #define OVC_CLK_GATE_B_SET	0xD8	/* bits [9:1] */
+#define OVC_CLK_GATE_B_CLR	0xDC
+#define OVC_CLK_GATE_A_MASK	0x3F
+#define OVC_CLK_GATE_B_MASK	0x3FE
 #define OVC_RST0_ASSERT		0xE0
 #define OVC_RST0_DEASSERT	0xE4
 #define OVC_RST1_ASSERT		0xE8
@@ -328,6 +334,7 @@ struct ovc_dev {
 	void __iomem *regs;	/* 0x02400000 ISP/VIN register file */
 	struct regmap *clkrst;	/* 0x02500000 isp syscon (clock/reset window) */
 	struct clk_bulk_data clks[OVC_NUM_CLKS];
+	int irq;
 
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
@@ -1163,17 +1170,54 @@ static int ovc_csi2_stream(struct ovc_dev *ovc, bool on)
 	return (ret == -ENOIOCTLCMD) ? 0 : ret;
 }
 
+/* Block new AXI requests and wait for outstanding transfers to drain. */
+static int ovc_axi_quiesce(struct ovc_dev *ovc)
+{
+	u32 busy;
+	int ret;
+
+	ovc_wr(ovc, OVC_AXI_IFE_CTRL, U32_MAX);
+	ovc_wr(ovc, OVC_AXI_ITP_CTRL, U32_MAX);
+	ovc_wr(ovc, OVC_AXI_YUV_CTRL, U32_MAX);
+	ret = read_poll_timeout(ovc_rd, busy, !busy, 200, 10000,
+				false, ovc, OVC_AXI_IFE_STAT);
+	if (!ret)
+		ret = read_poll_timeout(ovc_rd, busy, !busy, 200, 10000,
+					false, ovc, OVC_AXI_ITP_STAT);
+	if (!ret)
+		ret = read_poll_timeout(ovc_rd, busy, !busy, 200, 10000,
+					false, ovc, OVC_AXI_YUV_STAT);
+	return ret;
+}
+
+static void ovc_axi_resume(struct ovc_dev *ovc)
+{
+	ovc_wr(ovc, OVC_AXI_IFE_CTRL, 0);
+	ovc_wr(ovc, OVC_AXI_ITP_CTRL, 0);
+	ovc_wr(ovc, OVC_AXI_YUV_CTRL, 0);
+}
+
 static int ovc_start_streaming(struct vb2_queue *vq, unsigned int count)
 {
 	struct ovc_dev *ovc = vb2_get_drv_priv(vq);
 	unsigned long flags;
 	int ret;
 
+	ret = pm_runtime_resume_and_get(ovc->dev);
+	if (ret < 0) {
+		ovc_return_buffers(ovc, VB2_BUF_STATE_QUEUED);
+		return ret;
+	}
+
+	/* A quick restart may cancel autosuspend while AXI is still quiesced. */
+	ovc_axi_resume(ovc);
 	/* Receiver first: no point programming the datapath without a link. */
 	ret = ovc_csi2_stream(ovc, true);
 	if (ret) {
 		dev_err(ovc->dev, "CSI-2 receiver start failed: %d\n", ret);
 		ovc_return_buffers(ovc, VB2_BUF_STATE_QUEUED);
+		pm_runtime_mark_last_busy(ovc->dev);
+		pm_runtime_put_autosuspend(ovc->dev);
 		return ret;
 	}
 
@@ -1219,6 +1263,8 @@ static void ovc_stop_streaming(struct vb2_queue *vq)
 {
 	struct ovc_dev *ovc = vb2_get_drv_priv(vq);
 
+	/* The frame-done ISR must not re-arm WDMA while we stop it. */
+	disable_irq(ovc->irq);
 	/* reverse order: stop the source, then the datapath, then the IRQ */
 	ovc_sif_stop(ovc);
 	/* vendor stop case: clear the shadow-load trigger */
@@ -1227,10 +1273,14 @@ static void ovc_stop_streaming(struct vb2_queue *vq)
 	ovc_ife_go(ovc, false);
 	ovc_irq_teardown(ovc);
 
-	ovc_return_buffers(ovc, VB2_BUF_STATE_ERROR);
-
 	/* Receiver last, mirroring start (it was brought up first). */
 	ovc_csi2_stream(ovc, false);
+	if (ovc_axi_quiesce(ovc))
+		dev_warn(ovc->dev, "AXI drain timed out at STREAMOFF\n");
+	ovc_return_buffers(ovc, VB2_BUF_STATE_ERROR);
+	enable_irq(ovc->irq);
+	pm_runtime_mark_last_busy(ovc->dev);
+	pm_runtime_put_autosuspend(ovc->dev);
 }
 
 static const struct vb2_ops ovc_vb2_ops = {
@@ -1523,6 +1573,52 @@ err_cleanup:
 	return ret;
 }
 
+static int ovc_runtime_suspend(struct device *dev)
+{
+	struct ovc_dev *ovc = dev_get_drvdata(dev);
+	int ret;
+
+	/*
+	 * STREAMOFF has stopped WDMA and the CSI PHY. Drain IRQs and AXI
+	 * before gating the internal ISP clocks or their common parents.
+	 */
+	disable_irq(ovc->irq);
+	ret = ovc_axi_quiesce(ovc);
+	if (ret) {
+		/* Keep requests blocked until the next STREAMON. */
+		enable_irq(ovc->irq);
+		dev_warn_ratelimited(dev, "AXI masters busy; keeping VIN clocks on\n");
+		return -EBUSY;
+	}
+	ovc_clkrst_wr(ovc, OVC_CLK_GATE_B_CLR, OVC_CLK_GATE_B_MASK);
+	ovc_clkrst_wr(ovc, OVC_CLK_GATE_A_CLR, OVC_CLK_GATE_A_MASK);
+	clk_bulk_disable_unprepare(OVC_NUM_CLKS, ovc->clks);
+	return 0;
+}
+
+static int ovc_runtime_resume(struct device *dev)
+{
+	struct ovc_dev *ovc = dev_get_drvdata(dev);
+	int ret;
+
+	ret = clk_bulk_prepare_enable(OVC_NUM_CLKS, ovc->clks);
+	if (ret)
+		return ret;
+	/*
+	 * Clock gating retains mux/register state. Never repeat the global
+	 * reset sweep here: it also covers the CSI receiver's reset lines.
+	 */
+	ovc_clkrst_wr(ovc, OVC_CLK_GATE_A_SET, OVC_CLK_GATE_A_MASK);
+	ovc_clkrst_wr(ovc, OVC_CLK_GATE_B_SET, OVC_CLK_GATE_B_MASK);
+	ovc_axi_resume(ovc);
+	enable_irq(ovc->irq);
+	return 0;
+}
+
+static const struct dev_pm_ops ovc_pm_ops = {
+	RUNTIME_PM_OPS(ovc_runtime_suspend, ovc_runtime_resume, NULL)
+};
+
 static int ovc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1563,6 +1659,7 @@ static int ovc_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	ovc->irq = irq;
 
 	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
@@ -1627,6 +1724,14 @@ static int ovc_probe(struct platform_device *pdev)
 		dev_err(dev, "request_irq(%d) failed: %d\n", irq, ret);
 		goto err_clk;
 	}
+	ovc_irq_setup(ovc);
+	ovc_irq_teardown(ovc);
+	platform_set_drvdata(pdev, ovc);
+	pm_runtime_set_active(dev);
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_autosuspend_delay(dev, 1000);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
 
 	/* Media controller: the graph is csi2 (source pad 1) -> video0 (pad 0). */
 	ovc->mdev.dev = dev;
@@ -1639,7 +1744,7 @@ static int ovc_probe(struct platform_device *pdev)
 	ret = v4l2_device_register(dev, &ovc->v4l2_dev);
 	if (ret) {
 		media_device_cleanup(&ovc->mdev);
-		goto err_clk;
+		goto err_pm;
 	}
 
 	q = &ovc->queue;
@@ -1712,6 +1817,8 @@ static int ovc_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_mdev;
 
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 	return 0;
 
 err_mdev:
@@ -1723,6 +1830,11 @@ err_entity:
 err_v4l2:
 	v4l2_device_unregister(&ovc->v4l2_dev);
 	media_device_cleanup(&ovc->mdev);
+err_pm:
+	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_set_suspended(dev);
 err_clk:
 	clk_bulk_disable_unprepare(OVC_NUM_CLKS, ovc->clks);
 err_rmem:
@@ -1733,6 +1845,13 @@ err_rmem:
 static void ovc_remove(struct platform_device *pdev)
 {
 	struct ovc_dev *ovc = platform_get_drvdata(pdev);
+	struct device *dev = &pdev->dev;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		dev_err(dev, "cannot resume VIN for removal: %d\n", ret);
+	pm_runtime_disable(dev);
 
 	if (ovc->notifier_registered) {
 		v4l2_async_nf_unregister(&ovc->notifier);
@@ -1743,7 +1862,13 @@ static void ovc_remove(struct platform_device *pdev)
 	media_entity_cleanup(&ovc->vdev.entity);
 	v4l2_device_unregister(&ovc->v4l2_dev);
 	media_device_cleanup(&ovc->mdev);
-	clk_bulk_disable_unprepare(OVC_NUM_CLKS, ovc->clks);
+	if (ret >= 0) {
+		disable_irq(ovc->irq);
+		clk_bulk_disable_unprepare(OVC_NUM_CLKS, ovc->clks);
+		pm_runtime_put_noidle(dev);
+	}
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_set_suspended(dev);
 	of_reserved_mem_device_release(&pdev->dev);
 }
 
@@ -1759,6 +1884,7 @@ static struct platform_driver ovc_driver = {
 	.driver	= {
 		.name		= OVC_DRV_NAME,
 		.of_match_table	= ovc_of_match,
+		.pm		= pm_ptr(&ovc_pm_ops),
 	},
 };
 module_platform_driver(ovc_driver);
