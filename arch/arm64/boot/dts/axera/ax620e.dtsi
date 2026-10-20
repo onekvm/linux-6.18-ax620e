@@ -17,6 +17,8 @@
 		ethernet0 = &eth0;
 		serial0 = &uart0;
 		mmc0 = &emmc;
+		mmc1 = &sdio;
+		mmc2 = &sd;
 		i2c0 = &i2c0;
 		i2c7 = &i2c7;
 	};
@@ -188,6 +190,14 @@
 		clock-output-names = "emmc_core";
 	};
 
+	/* The Axera SDHCI init programs the SD card source to 200 MHz. */
+	sd_core_clk: sd-core-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "sd_core";
+	};
+
 	thermal-zones {
 		soc-thermal {
 			polling-delay = <1000>;
@@ -308,11 +318,13 @@
 			reg = <0x0 0x04430000 0x0 0x10000>;
 			#clock-cells = <1>;
 		};
+
 		mm_reset_async: reset-controller@4430000 {
 			compatible = "axera,axera_reset_match", "syscon";
 			reg = <0x0 0x04430000 0x0 0x10000>;
 			#reset-cells = <10>;
 		};
+
 		tdp: image-processor@4405000 {
 			compatible = "axera,ax630c-tdp";
 			reg = <0x0 0x04405000 0x0 0x1000>;
@@ -534,6 +546,47 @@
 				pins = "VI_D9";
 				function = "I2C7_SDA";
 				drive-strength = <3>;
+				bias-pull-up;
+			};
+
+			sd_power_pins: sd-power-pins {
+				pins = "SD_PWR_EN";
+				function = "SD_PWR_EN";
+				drive-strength = <3>;
+				bias-pull-down;
+			};
+			sd_voltage_pins: sd-voltage-pins {
+				pins = "SD_PWR_SW";
+				function = "SD_PWR_SW";
+				drive-strength = <3>;
+			};
+			sd_clk_pins: sd-clk-pins {
+				pins = "SD_CLK";
+				function = "SD_CLK";
+			};
+			sd_cmd_pins: sd-cmd-pins {
+				pins = "SD_CMD";
+				function = "SD_CMD";
+				bias-pull-up;
+			};
+			sd_dat0_pins: sd-dat0-pins {
+				pins = "SD_DAT0";
+				function = "SD_DAT0";
+				bias-pull-up;
+			};
+			sd_dat1_pins: sd-dat1-pins {
+				pins = "SD_DAT1";
+				function = "SD_DAT1";
+				bias-pull-up;
+			};
+			sd_dat2_pins: sd-dat2-pins {
+				pins = "SD_DAT2";
+				function = "SD_DAT2";
+				bias-pull-up;
+			};
+			sd_dat3_pins: sd-dat3-pins {
+				pins = "SD_DAT3";
+				function = "SD_DAT3";
 				bias-pull-up;
 			};
 
@@ -794,6 +847,18 @@
 			resets = <&cpu_reset_ext 12 0x1010 12 0x2010>,
 				 <&cpu_reset_ext 12 0x1010 12 0x2010>,
 				 <&cpu_reset_ext 11 0x1010 11 0x2010>;
+			reset-names = "prst", "arst", "cardrst";
+			status = "disabled";
+		};
+
+		sd: mmc@104e0000 {
+			compatible = "axera,sdhc", "cdns,sd4hc";
+			reg = <0x0 0x104e0000 0x0 0x10000>;
+			interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sd_core_clk>;
+			resets = <&flash_reset_ext 17 0x4014 17 0x8014>,
+				 <&flash_reset_ext 16 0x4014 16 0x8014>,
+				 <&flash_reset_ext 15 0x4014 15 0x8014>;
 			reset-names = "prst", "arst", "cardrst";
 			status = "disabled";
 		};

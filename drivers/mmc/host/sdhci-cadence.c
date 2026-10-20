@@ -80,6 +80,15 @@
  */
 #define SDHCI_CDNS_MAX_TUNING_LOOP	40
 
+/* AX630C SD CMD/DAT input pads have a separate voltage selector. */
+#define SDHCI_AXERA_SD_PAD_BASE		0x104f1000
+#define SDHCI_AXERA_SD_PAD_SET		0x04
+#define SDHCI_AXERA_SD_PAD_CLR		0x08
+#define SDHCI_AXERA_SD_PAD_180		GENMASK(8, 7)
+#define SDHCI_AXERA_SD_PAD_VDET		0x58
+#define SDHCI_AXERA_SD_PAD_VDET_330	BIT(0)
+#define SDHCI_AXERA_HRS35			0x8c
+
 struct sdhci_cdns_phy_param {
 	u8 addr;
 	u8 data;
@@ -91,6 +100,8 @@ struct sdhci_cdns_priv {
 	spinlock_t wrlock;	/* write lock */
 	bool enhanced_strobe;
 	bool phy_dll_reset;
+	void __iomem *axera_sd_pad;
+	unsigned int axera_sd_clock;
 	void (*priv_writel)(struct sdhci_cdns_priv *priv, u32 val, void __iomem *reg);
 	struct reset_control *rst_hw;
 	unsigned int nr_phy_params;
@@ -530,9 +541,127 @@ static int sdhci_axera_deassert(struct device *dev, const char *name)
 	return 0;
 }
 
+static int sdhci_axera_sd_voltage_switch(struct mmc_host *mmc,
+					struct mmc_ios *ios)
+{
+	struct sdhci_host *host = mmc_priv(mmc);
+	struct sdhci_cdns_priv *priv = sdhci_cdns_priv(host);
+	u32 val;
+	int ret;
+
+	if (ios->signal_voltage != MMC_SIGNAL_VOLTAGE_330 &&
+	    ios->signal_voltage != MMC_SIGNAL_VOLTAGE_180)
+		return -EINVAL;
+
+	ret = sdhci_start_signal_voltage_switch(mmc, ios);
+	if (ret)
+		return ret;
+
+	/* Also restore the pads on initial power-up and failed CMD11 recovery. */
+	if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_330) {
+		writel(SDHCI_AXERA_SD_PAD_180,
+		       priv->axera_sd_pad + SDHCI_AXERA_SD_PAD_CLR);
+		return 0;
+	}
+
+	/* The external switch needs longer than the SDHCI VDD_180 latch. */
+	usleep_range(15000, 15500);
+	ret = readl_poll_timeout(priv->axera_sd_pad + SDHCI_AXERA_SD_PAD_VDET,
+				 val, !(val & SDHCI_AXERA_SD_PAD_VDET_330),
+				 100, 5000);
+	if (ret) {
+		dev_err(mmc_dev(mmc), "SD pad voltage did not reach 1.8 V\n");
+		return -EAGAIN;
+	}
+
+	writel(SDHCI_AXERA_SD_PAD_180,
+	       priv->axera_sd_pad + SDHCI_AXERA_SD_PAD_SET);
+	return 0;
+}
+
+static void sdhci_axera_sd_set_clock(struct sdhci_host *host,
+				    unsigned int clock)
+{
+	struct sdhci_cdns_priv *priv = sdhci_cdns_priv(host);
+	int ret;
+
+	sdhci_set_clock(host, clock);
+	if (!clock || host->mmc->actual_clock == priv->axera_sd_clock)
+		return;
+
+	/* Re-lock the PHY DLL after a frequency change, not a clock gate. */
+	ret = sdhci_cdns_write_phy_reg(priv, SDHCI_CDNS_PHY_DLL_RESET, 0);
+	if (!ret)
+		ret = sdhci_cdns_write_phy_reg(priv, SDHCI_CDNS_PHY_DLL_RESET, 1);
+	if (ret) {
+		dev_err(mmc_dev(host->mmc), "SD PHY DLL reset failed: %d\n", ret);
+		sdhci_set_clock(host, 0);
+		priv->axera_sd_clock = 0;
+		return;
+	}
+
+	priv->axera_sd_clock = host->mmc->actual_clock;
+	mmc_retune_needed(host->mmc);
+}
+
+static int sdhci_axera_sd_execute_tuning(struct sdhci_host *host, u32 opcode)
+{
+	struct sdhci_cdns_priv *priv = sdhci_cdns_priv(host);
+	unsigned long flags;
+	int i, ret = -EIO;
+	u16 ctrl;
+
+	/* Axera SD uses the SDHCI hardware sweep, not the eMMC HRS06 scan. */
+	host->mmc->retune_period = host->tuning_mode == SDHCI_TUNING_MODE_1 ?
+				   host->tuning_count : 0;
+	sdhci_reset_tuning(host);
+	sdhci_start_tuning(host);
+
+	for (i = 0; i < SDHCI_CDNS_MAX_TUNING_LOOP; i++) {
+		sdhci_send_tuning(host, opcode);
+		if (!host->tuning_done) {
+			/* A bad phase can time out; let the hardware sweep continue. */
+			spin_lock_irqsave(&host->lock, flags);
+			sdhci_reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+			spin_unlock_irqrestore(&host->lock, flags);
+			ret = -ETIMEDOUT;
+		}
+
+		usleep_range(5000, 5500);
+		ctrl = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+		if (!(ctrl & SDHCI_CTRL_EXEC_TUNING)) {
+			if (ctrl & SDHCI_CTRL_TUNED_CLK)
+				ret = 0;
+			break;
+		}
+	}
+
+	if (ret) {
+		sdhci_abort_tuning(host, opcode);
+		dev_err(mmc_dev(host->mmc), "SD hardware tuning failed: %d\n", ret);
+	} else {
+		dev_dbg(mmc_dev(host->mmc), "SD hardware tuning: 0x%x\n",
+			readl(priv->hrs_addr + SDHCI_AXERA_HRS35));
+		sdhci_end_tuning(host);
+	}
+	host->tuning_err = ret;
+	return ret;
+}
+
+static const struct sdhci_ops sdhci_axera_sd_ops = {
+	.set_clock = sdhci_axera_sd_set_clock,
+	.get_timeout_clock = sdhci_cdns_get_timeout_clock,
+	.set_bus_width = sdhci_set_bus_width,
+	.reset = sdhci_reset,
+	.platform_execute_tuning = sdhci_axera_sd_execute_tuning,
+	.set_uhs_signaling = sdhci_cdns_set_uhs_signaling,
+};
+
 static int sdhci_axera_init(struct platform_device *pdev)
 {
 	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	struct sdhci_host *host = platform_get_drvdata(pdev);
+	struct sdhci_cdns_priv *priv = sdhci_cdns_priv(host);
 	void __iomem *cpu, *flash;
 	resource_size_t start;
 	int ret;
@@ -540,6 +669,16 @@ static int sdhci_axera_init(struct platform_device *pdev)
 	if (!res)
 		return -EINVAL;
 	start = res->start;
+
+	if (start == 0x104e0000) {
+		priv->axera_sd_pad = devm_ioremap(&pdev->dev,
+						SDHCI_AXERA_SD_PAD_BASE, 0x100);
+		if (!priv->axera_sd_pad)
+			return -ENOMEM;
+		host->ops = &sdhci_axera_sd_ops;
+		host->mmc_host_ops.start_signal_voltage_switch =
+			sdhci_axera_sd_voltage_switch;
+	}
 
 	/* Vendor sdhci-axera releases prst, arst and cardrst before the card clock. */
 	ret = sdhci_axera_deassert(&pdev->dev, "prst");
@@ -573,7 +712,8 @@ static int sdhci_axera_init(struct platform_device *pdev)
 	if (!flash)
 		return -ENOMEM;
 	if (start == 0x104e0000) {
-		writel(BIT(17) | BIT(3), flash + 0x4008);
+		/* PCLK_PINMUX (bit 16) also clocks the G9 voltage detector. */
+		writel(BIT(17) | BIT(16) | BIT(3), flash + 0x4008);
 		writel(BIT(9), flash + 0x8004);
 		udelay(2);
 		writel(0x3 << 16, flash + 0x8000);
