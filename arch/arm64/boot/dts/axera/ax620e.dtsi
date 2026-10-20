@@ -167,7 +167,7 @@
 		always-on;
 	};
 
-	/* Vendor 4.19 GIC-400: 4 KiB GICC, no VGIC maintenance PPI. */
+	/* GICC includes DIR at +0x1000; VGIC maintenance is PPI 9 (INTID 25). */
 	gic: interrupt-controller@1850000 {
 		compatible = "arm,gic-400";
 		#interrupt-cells = <3>;
@@ -175,9 +175,10 @@
 		#size-cells = <2>;
 		interrupt-controller;
 		reg = <0x0 0x01851000 0x0 0x1000>,
-		      <0x0 0x01852000 0x0 0x1000>,
+		      <0x0 0x01852000 0x0 0x2000>,
 		      <0x0 0x01854000 0x0 0x2000>,
 		      <0x0 0x01856000 0x0 0x2000>;
+		interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_LEVEL_HIGH)>;
 	};
 
 	emmc_core_clk: emmc-core-clk {

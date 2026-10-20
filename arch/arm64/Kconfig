@@ -127,8 +127,8 @@ config ARM64
 	select ARM_GIC
 	select AUDIT_ARCH_COMPAT_GENERIC
 	select ARM_GIC_V2M if PCI
-	# The AX620E family uses GIC-400; it has no GICv3/v5 distributor.
-	select ARM_GIC_V3 if !ARCH_AXERA
+	# AX620E uses GIC-400, but KVM's virtual GIC links against GICv3/ITS.
+	select ARM_GIC_V3 if !ARCH_AXERA || KVM
 	select ARM_GIC_V3_ITS if PCI && !ARCH_AXERA
 	select ARM_GIC_V5 if !ARCH_AXERA
 	select ARM_PSCI_FW
