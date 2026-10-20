@@ -670,8 +670,6 @@ static void __init psci_0_2_set_functions(void)
 	};
 
 	register_restart_handler(&psci_sys_reset_nb);
-
-	pm_power_off = psci_sys_poweroff;
 }
 
 /*
@@ -691,6 +689,17 @@ static int __init psci_probe(void)
 	}
 
 	psci_0_2_set_functions();
+
+	/*
+	 * Some firmware (including AX630C) omits SYSTEM_OFF. Do not advertise
+	 * power-off in that case: the reboot syscall can safely fall back to
+	 * halt before stopping the secondary CPUs. PSCI v0.2 has no FEATURES.
+	 */
+	if (PSCI_VERSION_MAJOR(ver) == 0 ||
+	    psci_features(PSCI_0_2_FN_SYSTEM_OFF) >= 0)
+		pm_power_off = psci_sys_poweroff;
+	else
+		pr_info("SYSTEM_OFF not supported; poweroff will halt\n");
 
 	psci_init_migrate();
 

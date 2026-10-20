@@ -15,6 +15,16 @@
 	model = "Sipeed NanoKVM Pro (AX630C)";
 	compatible = "sipeed,nanokvm-pro", "axera,ax630c", "axera,ax620e";
 
+	/* The vendor ATF does not implement PSCI SYSTEM_RESET. */
+	reboot {
+		compatible = "syscon-reboot";
+		regmap = <&common_reset>;
+		offset = <0xa8>;
+		mask = <0x1>;
+		value = <0x1>;
+		priority = <192>;
+	};
+
 	chosen {
 		stdout-path = "serial0:115200n8";
 		bootargs = "earlycon=uart8250,mmio32,0x04880000 console=ttyS0,115200n8";
