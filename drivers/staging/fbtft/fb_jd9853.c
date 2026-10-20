@@ -4,7 +4,8 @@
  *
  * Register sequence is the Sipeed 4.19 fb_jd9853 init (iawak9lkm), run twice.
  * The panel is a 172-column window at column offset 0x22 on a 240-column
- * controller, so every update rewrites the whole framebuffer. No tearing-effect
+ * controller. Unchanged frames are skipped; changed rows use a matching window.
+ * No tearing-effect
  * pin and no DMA byte swap: stock spi-dw-mmio is PIO and does not swap.
  *
  * Mainline fbtft uses the logical GPIO API. dc-gpios must be ACTIVE_HIGH
@@ -17,6 +18,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <video/mipi_display.h>
 
 #include "fbtft.h"
@@ -34,10 +36,19 @@
 #define JD9853_ROW_START	0x0000
 #define JD9853_ROW_END		0x013f
 
+struct jd9853_frame {
+	u8 *snapshot;
+	u8 *last;
+	bool valid;
+};
+
 static int set_var(struct fbtft_par *par)
 {
+	struct jd9853_frame *frame = par->extra;
 	u8 madctl = 0;
 
+	if (frame)
+		frame->valid = false;
 	if (par->bgr)
 		madctl |= MADCTL_BGR;
 
@@ -88,42 +99,118 @@ static void set_addr_win(struct fbtft_par *par, int xs, int ys, int xe, int ye)
 	write_reg(par, MIPI_DCS_WRITE_MEMORY_START);
 }
 
-/*
- * The column window is fixed, so a partial update would land at the top.
- * SPI has no tearing-effect pin. Copy the frame first: write_vmem reads
- * screen_buffer for the whole transfer, and a userspace rewrite during
- * that transfer splits the highlight from the rest of the row.
- */
-static int write_vmem_full(struct fbtft_par *par, size_t offset, size_t len)
+/* Keep the 0x22 column offset and move the row window with the payload. */
+static int write_rows(struct fbtft_par *par, unsigned int first,
+		      unsigned int last)
 {
 	struct fb_info *info = par->info;
-	size_t n = info->fix.smem_len;
-	void *live, *snap = par->extra;
+	struct jd9853_frame *frame = par->extra;
+	size_t offset = first * info->fix.line_length;
+	size_t len = (last - first + 1) * info->fix.line_length;
+	void *live = info->screen_buffer;
 	int ret;
 
-	if (!snap) {
-		snap = devm_kmalloc(info->device, n, GFP_KERNEL);
-		if (!snap)
-			return fbtft_write_vmem16_bus8(par, 0, n);
-		par->extra = snap;
+	if (info->var.rotate == 90 || info->var.rotate == 270) {
+		/* Preserve the existing full-window hardware-rotation path. */
+		set_addr_win(par, 0, 0, 0, 0);
+	} else {
+		write_reg(par, MIPI_DCS_SET_COLUMN_ADDRESS,
+			  JD9853_COL_START >> 8, JD9853_COL_START & 0xff,
+			  JD9853_COL_END >> 8, JD9853_COL_END & 0xff);
+		write_reg(par, MIPI_DCS_SET_PAGE_ADDRESS,
+			  first >> 8, first & 0xff, last >> 8, last & 0xff);
+		write_reg(par, MIPI_DCS_WRITE_MEMORY_START);
 	}
-	memcpy(snap, info->screen_buffer, n);
-	live = info->screen_buffer;
-	info->screen_buffer = snap;
-	ret = fbtft_write_vmem16_bus8(par, 0, n);
+	/* Snapshot before transfer: mmap writers may replace the next frame. */
+	info->screen_buffer = frame->snapshot;
+	ret = fbtft_write_vmem16_bus8(par, offset, len);
 	info->screen_buffer = live;
 	return ret;
 }
 
+static void update_display(struct fbtft_par *par, unsigned int start_line,
+			   unsigned int end_line)
+{
+	struct fb_info *info = par->info;
+	struct jd9853_frame *frame = par->extra;
+	size_t stride = info->fix.line_length;
+	unsigned int first, row, height = info->var.yres;
+	int ret;
+
+	/* fbdev page damage can cover unchanged rows. Compare actual pixels,
+	 * including disjoint runs such as the clock's old and new second dot.
+	 */
+	memcpy(frame->snapshot, info->screen_buffer, info->fix.smem_len);
+	if (frame->valid &&
+	    !memcmp(frame->snapshot, frame->last, info->fix.smem_len))
+		return;
+
+	if (!frame->valid || info->var.rotate == 90 || info->var.rotate == 270) {
+		ret = write_rows(par, 0, height - 1);
+		if (ret < 0)
+			goto failed;
+	} else {
+		row = 0;
+		while (row < height) {
+			if (!memcmp(frame->snapshot + row * stride,
+				    frame->last + row * stride, stride)) {
+				row++;
+				continue;
+			}
+			first = row++;
+			while (row < height &&
+			       memcmp(frame->snapshot + row * stride,
+				      frame->last + row * stride, stride))
+				row++;
+			ret = write_rows(par, first, row - 1);
+			if (ret < 0)
+				goto failed;
+		}
+	}
+	memcpy(frame->last, frame->snapshot, info->fix.smem_len);
+	frame->valid = true;
+	/* Reset preserves GRAM. Never expose the previous boot's pixels while
+	 * either initialization pass is running; the first full transfer must
+	 * finish before the panel is allowed to scan out again.
+	 */
+	if (!par->first_update_done)
+		write_reg(par, MIPI_DCS_SET_DISPLAY_ON);
+	par->first_update_done = true;
+	return;
+
+failed:
+	/* A partial failure needs a complete redraw on the next update. */
+	frame->valid = false;
+	dev_err(info->device, "display update failed: %d\n", ret);
+}
+
 static int blank(struct fbtft_par *par, bool on)
 {
+	if (!on && !par->first_update_done)
+		return 0;
 	write_reg(par, on ? MIPI_DCS_SET_DISPLAY_OFF : MIPI_DCS_SET_DISPLAY_ON);
 	return 0;
 }
 
 static int init_display(struct fbtft_par *par)
 {
+	struct jd9853_frame *frame = par->extra;
 	int i;
+
+	if (!frame) {
+		frame = devm_kzalloc(par->info->device, sizeof(*frame), GFP_KERNEL);
+		if (!frame)
+			return -ENOMEM;
+		frame->snapshot = devm_kmalloc(par->info->device,
+					      par->info->fix.smem_len, GFP_KERNEL);
+		frame->last = devm_kmalloc(par->info->device,
+					  par->info->fix.smem_len, GFP_KERNEL);
+		if (!frame->snapshot || !frame->last)
+			return -ENOMEM;
+		par->extra = frame;
+	}
+	frame->valid = false;
+	par->first_update_done = false;
 
 	for (i = 0; i < 2; i++) {
 		mdelay(100);
@@ -169,8 +256,6 @@ static int init_display(struct fbtft_par *par)
 		write_reg(par, 0xDE, 0x02);
 		write_reg(par, 0xE5, 0x00, 0x02, 0x00);
 		write_reg(par, 0xDE, 0x00);
-		write_reg(par, MIPI_DCS_SET_DISPLAY_ON);
-		mdelay(10);
 	}
 
 	return 0;
@@ -187,7 +272,7 @@ static struct fbtft_display display = {
 		.init_display = init_display,
 		.set_var = set_var,
 		.set_addr_win = set_addr_win,
-		.write_vmem = write_vmem_full,
+		.update_display = update_display,
 		.blank = blank,
 	},
 };
