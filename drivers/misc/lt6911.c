@@ -222,6 +222,7 @@ struct lt6911 {
 	enum lt6911_chip chip;
 	bool powered;
 	bool shadow_override;
+	bool shadow_restore_pending;
 	u8 shadow_desired[LT6911_EDID_SIZE];
 
 	struct gpio_desc *int_gpio;
@@ -669,13 +670,16 @@ static int lt6911_set_power(struct lt6911 *lt, bool on)
 	}
 
 	lt->powered = on;
+	if (!on && lt->shadow_override)
+		lt->shadow_restore_pending = true;
 	mutex_lock(&lt->buf_lock);
 	lt6911_set_text(&lt->power, on ? "on\n" : "off\n");
 	mutex_unlock(&lt->buf_lock);
 
-	if (on && !was_powered && lt->shadow_override) {
+	if (on && lt->shadow_override && (!was_powered || lt->shadow_restore_pending)) {
 		msleep(300);
 		ret = lt6911uxc_shadow_apply(lt, lt->shadow_desired, actual);
+		lt->shadow_restore_pending = ret != 0;
 		mutex_lock(&lt->buf_lock);
 		lt->edid_snapshot_len = ret ? 0 : LT6911_EDID_SIZE;
 		if (!ret)
@@ -2635,6 +2639,7 @@ static ssize_t lt6911_shadow_proc_write(struct file *file,
 	if (!ret) {
 		memcpy(lt->shadow_desired, data, count);
 		lt->shadow_override = true;
+		lt->shadow_restore_pending = false;
 		mutex_lock(&lt->buf_lock);
 		memcpy(lt->edid_snapshot, actual, count);
 		lt->edid_snapshot_len = count;
