@@ -1197,7 +1197,8 @@ static int lt6911c_edid_read(struct lt6911 *lt, u8 *edid)
 	if (ret)
 		return ret;
 	/* Unknown firmware layouts must not become writable just from a chip ID. */
-	if (edid[126] != 1 || lt6911_check_edid(lt, edid, LT6911_EDID_SIZE))
+	if (memchr_inv(edid, 0xff, LT6911_EDID_SIZE) &&
+	    (edid[126] != 1 || lt6911_check_edid(lt, edid, LT6911_EDID_SIZE)))
 		return -EOPNOTSUPP;
 	return 0;
 }
@@ -1229,8 +1230,9 @@ static int lt6911c_edid_write(struct lt6911 *lt, const u8 *edid)
 		goto out;
 	}
 	if (memchr_inv(before, 0xff, LT6911C_EDID_OFFSET) ||
-	    before[LT6911C_EDID_OFFSET + 126] != 1 ||
-	    lt6911_check_edid(lt, before + LT6911C_EDID_OFFSET, LT6911_EDID_SIZE)) {
+	    (memchr_inv(before + LT6911C_EDID_OFFSET, 0xff, LT6911_EDID_SIZE) &&
+	     (before[LT6911C_EDID_OFFSET + 126] != 1 ||
+	      lt6911_check_edid(lt, before + LT6911C_EDID_OFFSET, LT6911_EDID_SIZE)))) {
 		dev_err(lt->dev, "unrecognized C flash layout; EDID left unchanged\n");
 		ret = -EOPNOTSUPP;
 		goto out;
