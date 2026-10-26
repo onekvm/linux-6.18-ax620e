@@ -2015,6 +2015,40 @@ static int lt6911_edid_write(struct lt6911 *lt, const u8 *edid)
 	return lt6911_flash_ack(lt);
 }
 
+/* Caller holds chip_lock and has stopped VIN. Permanent means bridge Flash. */
+static int lt6911_edid_apply_permanent(struct lt6911 *lt, const u8 *desired,
+				     u8 *actual)
+{
+	int ret;
+
+	ret = lt6911_edid_read(lt, actual);
+	if (ret)
+		return ret;
+	if (memcmp(desired, actual, LT6911_EDID_SIZE)) {
+		ret = lt6911_edid_write(lt, desired);
+		if (ret)
+			return ret;
+		ret = lt6911_edid_read(lt, actual);
+		if (ret)
+			return ret;
+		if (memcmp(desired, actual, LT6911_EDID_SIZE)) {
+			dev_err(lt->dev, "EDID Flash verification failed\n");
+			return -EIO;
+		}
+	}
+
+	/* Do not replay an older temporary value over the newly committed Flash. */
+	lt->shadow_override = false;
+	lt->shadow_restore_pending = false;
+	ret = lt6911_power_cycle(lt);
+	mutex_lock(&lt->buf_lock);
+	lt->edid_snapshot_len = ret ? 0 : LT6911_EDID_SIZE;
+	if (!ret)
+		memcpy(lt->edid_snapshot, actual, LT6911_EDID_SIZE);
+	mutex_unlock(&lt->buf_lock);
+	return ret;
+}
+
 /* Header and both block checksums, exactly the vendor's check_edid(). */
 static int lt6911_check_edid(struct lt6911 *lt, const u8 *edid, size_t len)
 {
@@ -2607,7 +2641,7 @@ static __poll_t lt6911_tx_status_poll(struct file *file, poll_table *wait)
  * ends in a power cycle: a caller that polls this file would otherwise hold
  * the bridge in permanent reset and there would be no video at all.
  */
-/* Caller has stopped VIN. Normal UXC EDID writes are RAM-only. */
+/* Caller has stopped VIN. This separate UXC interface is temporary RAM only. */
 static ssize_t lt6911_shadow_proc_write(struct file *file,
 				       const char __user *ubuf, size_t count,
 				       loff_t *ppos)
@@ -2670,9 +2704,6 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 	s64 age;
 	int ret;
 
-	if (lt->chip == LT6911_CHIP_UXC)
-		return lt6911_edid_snapshot_read(file, ubuf, count, ppos);
-
 	mutex_lock(&lt->chip_lock);
 
 	age = ktime_to_ms(ktime_sub(now, lt->edid_read_ts));
@@ -2687,8 +2718,10 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 
 		mutex_lock(&lt->buf_lock);
 		lt->edid_len = LT6911_EDID_SIZE;
-		memcpy(lt->edid_snapshot, lt->edid, LT6911_EDID_SIZE);
-		lt->edid_snapshot_len = LT6911_EDID_SIZE;
+		if (!lt->shadow_override) {
+			memcpy(lt->edid_snapshot, lt->edid, LT6911_EDID_SIZE);
+			lt->edid_snapshot_len = LT6911_EDID_SIZE;
+		}
 		mutex_unlock(&lt->buf_lock);
 
 		ret = lt6911_power_cycle(lt);
@@ -2719,9 +2752,6 @@ static ssize_t lt6911_edid_proc_write(struct file *file,
 	struct lt6911 *lt = pde_data(file_inode(file));
 	u8 *wbuf, *rbuf;
 	int ret;
-
-	if (lt->chip == LT6911_CHIP_UXC)
-		return lt6911_shadow_proc_write(file, ubuf, count, ppos);
 
 	/*
 	 * The Go server writes the whole 256-byte image in one syscall, and
@@ -2756,26 +2786,9 @@ static ssize_t lt6911_edid_proc_write(struct file *file,
 	if (ret)
 		goto out_unlock;
 
-	ret = lt6911_edid_write(lt, wbuf);
-	if (ret)
-		goto out_unlock;
-
-	ret = lt6911_edid_read(lt, rbuf);
-	if (ret)
-		goto out_unlock;
-
-	mutex_lock(&lt->buf_lock);
-	memcpy(lt->edid_snapshot, rbuf, LT6911_EDID_SIZE);
-	lt->edid_snapshot_len = LT6911_EDID_SIZE;
-	mutex_unlock(&lt->buf_lock);
-
-	if (memcmp(wbuf, rbuf, LT6911_EDID_SIZE)) {
-		dev_err(lt->dev, "EDID write verification failed\n");
-		ret = -EIO;
-		goto out_unlock;
-	}
-
-	ret = lt6911_power_cycle(lt);
+	ret = lt6911_edid_apply_permanent(lt, wbuf, rbuf);
+	/* Flash reads may have cached the pre-write value. */
+	lt->edid_read_ts = 0;
 	if (ret)
 		goto out_unlock;
 
