@@ -9,7 +9,7 @@
  * interrupt line, and the serial flash behind the bridge that holds the EDID
  * the attached host actually sees.
  *
- * It publishes that state through /proc/lt6911_info/, a 16-file ABI that the
+ * It publishes that state through /proc/lt6911_info/, the proc ABI that the
  * NanoKVM userspace already speaks: libkvm scanf()s width/height/fps and
  * string-matches hdmi_rx_status, and the Go server exact-matches "on" on the
  * three power files, reads byte 12 of edid_snapshot to name the loaded EDID,
@@ -220,6 +220,9 @@ struct lt6911 {
 	struct i2c_client *client;
 	struct device *dev;
 	enum lt6911_chip chip;
+	bool powered;
+	bool shadow_override;
+	u8 shadow_desired[LT6911_EDID_SIZE];
 
 	struct gpio_desc *int_gpio;
 	struct gpio_desc *pwr_gpio;
@@ -651,9 +654,13 @@ found:
  * active high.
  */
 
+static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actual);
+
 static int lt6911_set_power(struct lt6911 *lt, bool on)
 {
 	int ret;
+	bool was_powered = lt->powered;
+	u8 actual[LT6911_EDID_SIZE];
 
 	ret = gpiod_set_value_cansleep(lt->pwr_gpio, on);
 	if (ret) {
@@ -661,10 +668,23 @@ static int lt6911_set_power(struct lt6911 *lt, bool on)
 		return ret;
 	}
 
+	lt->powered = on;
 	mutex_lock(&lt->buf_lock);
 	lt6911_set_text(&lt->power, on ? "on\n" : "off\n");
 	mutex_unlock(&lt->buf_lock);
 
+	if (on && !was_powered && lt->shadow_override) {
+		msleep(300);
+		ret = lt6911uxc_shadow_apply(lt, lt->shadow_desired, actual);
+		mutex_lock(&lt->buf_lock);
+		lt->edid_snapshot_len = ret ? 0 : LT6911_EDID_SIZE;
+		if (!ret)
+			memcpy(lt->edid_snapshot, actual, sizeof(actual));
+		mutex_unlock(&lt->buf_lock);
+		if (ret)
+			dev_err(lt->dev, "cannot restore UXC Shadow EDID: %d\n", ret);
+		return ret;
+	}
 	return 0;
 }
 
@@ -1027,6 +1047,196 @@ static int lt6911_get_fps(struct lt6911 *lt, u16 *fps)
 #define LT6911C_EDID_OFFSET 0x8000
 
 static int lt6911_check_edid(struct lt6911 *lt, const u8 *edid, size_t len);
+
+/* UXC Shadow profile observed on 107. Pro firmware acceptance is pending.
+ * Caller stops VIN before entering and holds chip_lock throughout. Only
+ * volatile registers are used; C/D must never reach this path.
+ */
+static int lt6911uxc_shadow_payload(struct lt6911 *lt, u8 *data, bool write)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < LT6911_EDID_SIZE; i++) {
+		ret = lt6911_write(lt, 0xb0, 0x0a, i);
+		if (ret)
+			return ret;
+		if (write)
+			ret = lt6911_write(lt, 0xb0, 0xb0, data[i]);
+		else
+			ret = lt6911_read(lt, 0xb0, 0xb0, &data[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int lt6911uxc_shadow_restore(struct lt6911 *lt, u8 gate, u8 watchdog,
+				   u8 index, u8 control, u8 hpd,
+				   bool watchdog_saved, bool state_saved)
+{
+	int ret = 0;
+
+	if (state_saved) {
+		if (lt6911_write(lt, 0xb0, 0x0b, control))
+			ret = -EIO;
+		if (lt6911_write(lt, 0xb0, 0x0a, index))
+			ret = -EIO;
+		if (lt6911_write(lt, 0xb0, 0x00, hpd))
+			ret = -EIO;
+	}
+	if (watchdog_saved && lt6911_write(lt, 0x80, 0x10, watchdog))
+		ret = -EIO;
+	if (lt6911_write(lt, 0x80, 0xee, gate))
+		ret = -EIO;
+	return ret;
+}
+
+static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actual)
+{
+	u8 gate, watchdog = 0, index = 0, control = 0, hpd = 0;
+	u8 before[LT6911_EDID_SIZE], verify[LT6911_EDID_SIZE];
+	u8 id[3];
+	bool watchdog_saved = false, state_saved = false, dirty = false;
+	unsigned int i;
+	int ret, cleanup;
+
+	if (lt->chip != LT6911_CHIP_UXC)
+		return -EOPNOTSUPP;
+	if (desired && (desired[126] != 1 ||
+			lt6911_check_edid(lt, desired, LT6911_EDID_SIZE)))
+		return -EINVAL;
+	ret = lt6911_read(lt, 0x80, 0xee, &gate);
+	if (ret)
+		return ret;
+	if (gate)
+		return -EBUSY;
+	ret = lt6911_enable(lt);
+	if (ret)
+		goto out;
+	for (i = 0; i < ARRAY_SIZE(id); i++) {
+		ret = lt6911_read(lt, 0x81, i, &id[i]);
+		if (ret)
+			goto out;
+	}
+	if (id[0] != 0x17 || id[1] != 0x04 || id[2] != 0x83) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = lt6911_read(lt, 0x80, 0x10, &watchdog);
+	if (ret)
+		goto out;
+	watchdog_saved = true;
+	ret = lt6911_write(lt, 0x80, 0x10, 0);
+	if (ret)
+		goto out;
+	ret = lt6911_read(lt, 0xb0, 0x0a, &index);
+	if (ret)
+		goto out;
+	ret = lt6911_read(lt, 0xb0, 0x0b, &control);
+	if (ret)
+		goto out;
+	ret = lt6911_read(lt, 0xb0, 0x00, &hpd);
+	if (ret)
+		goto out;
+	state_saved = true;
+	if (!(control & BIT(2))) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	ret = lt6911_write(lt, 0xb0, 0x00, hpd & ~BIT(0));
+	if (ret)
+		goto out;
+	msleep(200);
+	ret = lt6911uxc_shadow_payload(lt, before, false);
+	if (ret)
+		goto out;
+	ret = lt6911uxc_shadow_payload(lt, verify, false);
+	if (ret)
+		goto out;
+	if (memcmp(before, verify, sizeof(before)) || before[126] != 1 ||
+	    lt6911_check_edid(lt, before, sizeof(before))) {
+		ret = -EIO;
+		goto out;
+	}
+	if (!desired || !memcmp(before, desired, sizeof(before))) {
+		memcpy(actual, before, sizeof(before));
+		goto out;
+	}
+	ret = lt6911_write(lt, 0xb0, 0x0b, control & ~BIT(2));
+	if (ret)
+		goto out;
+	dirty = true;
+	/* The payload helper is shared with rollback, whose buffer is mutable. */
+	memcpy(verify, desired, sizeof(verify));
+	ret = lt6911uxc_shadow_payload(lt, verify, true);
+	if (ret)
+		goto out;
+	ret = lt6911uxc_shadow_payload(lt, verify, false);
+	if (ret)
+		goto out;
+	if (memcmp(verify, desired, sizeof(verify))) {
+		ret = -EIO;
+		goto out;
+	}
+	ret = lt6911_write(lt, 0xb0, 0x0b, control);
+	if (ret)
+		goto out;
+	ret = lt6911_disable(lt);
+	if (ret)
+		goto out;
+	msleep(20);
+	ret = lt6911_enable(lt);
+	if (ret)
+		goto out;
+	ret = lt6911uxc_shadow_payload(lt, verify, false);
+	if (ret)
+		goto out;
+	if (memcmp(verify, desired, sizeof(verify))) {
+		ret = -EIO;
+		goto out;
+	}
+	memcpy(actual, desired, sizeof(verify));
+out:
+	/* Successful RAM updates keep the MCU watchdog disabled, as the MMF
+	 * CSI arm does. Re-enabling it with custom RAM has not been validated.
+	 * Read-only snapshots and failed updates restore the original value.
+	 */
+	if (!ret) {
+		cleanup = lt6911uxc_shadow_restore(lt, gate, dirty ? 0 : watchdog,
+						index, control, hpd,
+						watchdog_saved, state_saved);
+		if (!cleanup)
+			return 0;
+		ret = cleanup;
+	}
+	if (dirty) {
+		cleanup = lt6911_enable(lt);
+		if (!cleanup)
+			cleanup = lt6911_write(lt, 0x80, 0x10, 0);
+		if (!cleanup)
+			cleanup = lt6911_write(lt, 0xb0, 0x00, hpd & ~BIT(0));
+		if (!cleanup) {
+			msleep(200);
+			cleanup = lt6911_write(lt, 0xb0, 0x0b, control & ~BIT(2));
+		}
+		if (!cleanup)
+			cleanup = lt6911uxc_shadow_payload(lt, before, true);
+		if (!cleanup)
+			cleanup = lt6911uxc_shadow_payload(lt, verify, false);
+		if (!cleanup && memcmp(before, verify, sizeof(before)))
+			cleanup = -EIO;
+		if (cleanup) {
+			/* Never reconnect the source with an unverified partial EDID. */
+			lt6911uxc_shadow_restore(lt, gate, 0, index, control,
+						hpd & ~BIT(0), true, true);
+			return -EUCLEAN;
+		}
+	}
+	cleanup = lt6911uxc_shadow_restore(lt, gate, watchdog, index, control, hpd,
+					watchdog_saved, state_saved);
+	return cleanup ? -EUCLEAN : ret;
+}
 
 static int lt6911c_flash_end(struct lt6911 *lt)
 {
@@ -2393,6 +2603,58 @@ static __poll_t lt6911_tx_status_poll(struct file *file, poll_table *wait)
  * ends in a power cycle: a caller that polls this file would otherwise hold
  * the bridge in permanent reset and there would be no video at all.
  */
+/* Caller has stopped VIN. Normal UXC EDID writes are RAM-only. */
+static ssize_t lt6911_shadow_proc_write(struct file *file,
+				       const char __user *ubuf, size_t count,
+				       loff_t *ppos)
+{
+	struct lt6911 *lt = pde_data(file_inode(file));
+	u8 *data, *actual;
+	int ret;
+
+	if (lt->chip != LT6911_CHIP_UXC)
+		return -EOPNOTSUPP;
+	if (count != LT6911_EDID_SIZE)
+		return -EINVAL;
+	data = kmalloc(2 * LT6911_EDID_SIZE, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	actual = data + LT6911_EDID_SIZE;
+	if (copy_from_user(data, ubuf, count)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	if (data[126] != 1 || lt6911_check_edid(lt, data, count)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	mutex_lock(&lt->chip_lock);
+	ret = lt6911_set_power(lt, true);
+	if (!ret)
+		ret = lt6911uxc_shadow_apply(lt, data, actual);
+	if (!ret) {
+		memcpy(lt->shadow_desired, data, count);
+		lt->shadow_override = true;
+		mutex_lock(&lt->buf_lock);
+		memcpy(lt->edid_snapshot, actual, count);
+		lt->edid_snapshot_len = count;
+		mutex_unlock(&lt->buf_lock);
+	} else if (ret == -EUCLEAN) {
+		mutex_lock(&lt->buf_lock);
+		lt->edid_snapshot_len = 0;
+		mutex_unlock(&lt->buf_lock);
+	}
+	mutex_unlock(&lt->chip_lock);
+	if (!ret)
+		schedule_work(&lt->info_work);
+out:
+	kfree(data);
+	return ret ? ret : count;
+}
+
+static ssize_t lt6911_edid_snapshot_read(struct file *file, char __user *ubuf,
+					 size_t count, loff_t *ppos);
+
 static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 				     size_t count, loff_t *ppos)
 {
@@ -2402,6 +2664,9 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 	size_t len;
 	s64 age;
 	int ret;
+
+	if (lt->chip == LT6911_CHIP_UXC)
+		return lt6911_edid_snapshot_read(file, ubuf, count, ppos);
 
 	mutex_lock(&lt->chip_lock);
 
@@ -2449,6 +2714,9 @@ static ssize_t lt6911_edid_proc_write(struct file *file,
 	struct lt6911 *lt = pde_data(file_inode(file));
 	u8 *wbuf, *rbuf;
 	int ret;
+
+	if (lt->chip == LT6911_CHIP_UXC)
+		return lt6911_shadow_proc_write(file, ubuf, count, ppos);
 
 	/*
 	 * The Go server writes the whole 256-byte image in one syscall, and
@@ -2716,6 +2984,12 @@ static const struct proc_ops lt6911_edid_ops = {
 	.proc_lseek = default_llseek,
 };
 
+static const struct proc_ops lt6911_edid_shadow_ops = {
+	.proc_read = lt6911_edid_snapshot_read,
+	.proc_write = lt6911_shadow_proc_write,
+	.proc_lseek = default_llseek,
+};
+
 static const struct proc_ops lt6911_edid_snapshot_ops = {
 	.proc_read = lt6911_edid_snapshot_read,
 	.proc_lseek = default_llseek,
@@ -2746,6 +3020,7 @@ static const struct {
 	{ "hdmi_rx_status",	0444, &lt6911_rx_status_ops },
 	{ "hdmi_tx_status",	0666, &lt6911_tx_status_ops },
 	{ "edid",		0666, &lt6911_edid_ops },
+	{ "edid_shadow",        0644, &lt6911_edid_shadow_ops },
 	{ "edid_snapshot",	0444, &lt6911_edid_snapshot_ops },
 	{ "version",		0666, &lt6911_version_ops },
 };
@@ -2760,6 +3035,10 @@ static int lt6911_proc_init(struct lt6911 *lt)
 
 	for (i = 0; i < ARRAY_SIZE(lt6911_proc_files); i++) {
 		umode_t mode = lt6911_proc_files[i].mode;
+
+		if (lt->chip != LT6911_CHIP_UXC &&
+		    !strcmp(lt6911_proc_files[i].name, "edid_shadow"))
+			continue;
 
 		if (lt->chip == LT6911_CHIP_C) {
 			if (!strcmp(lt6911_proc_files[i].name, "version"))
@@ -2930,6 +3209,7 @@ static int lt6911_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct lt6911 *lt;
+	u8 shadow[LT6911_EDID_SIZE];
 	int ret;
 
 	if (!i2c_check_functionality(client->adapter,
@@ -3033,11 +3313,13 @@ static int lt6911_probe(struct i2c_client *client)
 		lt->version[0] = '\0';
 	}
 
-	ret = lt6911_edid_read(lt, lt->edid_snapshot);
-	if (ret)
-		dev_warn(dev, "cannot read EDID: %d\n", ret);
-	else
-		lt->edid_snapshot_len = LT6911_EDID_SIZE;
+	if (lt->chip != LT6911_CHIP_UXC) {
+		ret = lt6911_edid_read(lt, lt->edid_snapshot);
+		if (ret)
+			dev_warn(dev, "cannot read EDID: %d\n", ret);
+		else
+			lt->edid_snapshot_len = LT6911_EDID_SIZE;
+	}
 	mutex_unlock(&lt->chip_lock);
 
 	ret = lt6911_proc_init(lt);
