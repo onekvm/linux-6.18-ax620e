@@ -644,11 +644,18 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+# Compatibility for deployed board configs using the old UXC-only name.
 config LT6911UXC
-	tristate "Lontium LT6911UXC HDMI receiver (NanoKVM Pro)"
+	tristate
+	transitional
+
+config LT6911
+	tristate "Lontium LT6911C/UXC/D HDMI receiver (NanoKVM Pro)"
+	default LT6911UXC
 	depends on I2C && GPIOLIB && PROC_FS
 	help
-	  Power, EDID, and HDMI-lock reporting for the LT6911UXC bridge
+	  Power and HDMI-lock reporting for LT6911C/UXC/D bridges, plus
+	  EDID and board-string flash access for UXC and D,
 	  on the NanoKVM Pro desk board. Publishes /proc/lt6911_info.
 	  The CSI-2 pixels are captured by the VIN driver, not here.
 

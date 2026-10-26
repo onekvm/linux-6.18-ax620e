@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Lontium LT6911UXC HDMI-to-CSI-2 bridge management, Sipeed NanoKVM-Pro.
+ * Lontium LT6911C/UXC/D HDMI-to-CSI-2 bridge management, Sipeed NanoKVM-Pro.
  *
  * This is deliberately not a media driver. The bridge's CSI-2 output is
  * consumed by the SoC capture path; what this driver owns is everything
@@ -18,13 +18,11 @@
  * those consumers. Do not tidy them.
  *
  * Ported from the vendor's 4.19 drivers/misc/lt6911_manage.c v0.0.32
- * (GPL-2.0), which this replaces. The port is scoped to the LT6911UXC: the
- * vendor file also carries LT6911C and LT6911D register maps and an AX-Pi
- * board variant, all reached through a board-version check that its own
- * header compiles to a constant (CHECK_BOARD_VERSION is commented out, so
- * board_version is always BOARD_VERSION_NanoKVM_PRO). This board has one
- * bridge and it is a UXC, so the other two chips and the probe-by-I2C-poke
- * that would pick between them are gone.
+ * (GPL-2.0), which this replaces. Boards sold as NanoKVM Pro can carry any
+ * of its three bridge variants. Probe their actual register IDs instead of
+ * inferring the silicon from the board name or DT's historical UXC spelling.
+ * LT6911C retains the vendor's limited capabilities: no flash operations,
+ * measured frame rate or HDCP reporting. The AX-Pi board is not supported.
  *
  * Differences from the vendor driver that are fixes, not preferences, are
  * marked "vendor bug" at the point where they matter.
@@ -39,6 +37,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/math64.h>
 #include <linux/ktime.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
@@ -194,6 +193,21 @@ enum lt6911_video {
 	LT6911_VIDEO_UNKNOWN,
 };
 
+enum lt6911_chip {
+	LT6911_CHIP_UNKNOWN,
+	LT6911_CHIP_UXC,
+	LT6911_CHIP_C,
+	LT6911_CHIP_D,
+};
+
+/* Sipeed SDK lt6911_manage.c v0.0.32: each silicon has its own map. */
+#define LT6911C_BANK_ID		0xa0
+#define LT6911C_BANK_HDMI		0xd2
+#define LT6911C_BANK_CSI		0xc2
+#define LT6911C_BANK_AUDIO	0xd1
+#define LT6911D_BANK_MANAGE	0xe0
+#define LT6911D_BANK_DATA		0xe1
+
 /* Per-fd poll state for the three pollable files. */
 struct lt6911_pollctx {
 	int status_gen;
@@ -204,6 +218,7 @@ struct lt6911_pollctx {
 struct lt6911 {
 	struct i2c_client *client;
 	struct device *dev;
+	enum lt6911_chip chip;
 
 	struct gpio_desc *int_gpio;
 	struct gpio_desc *pwr_gpio;
@@ -502,6 +517,10 @@ static int lt6911_read_block(struct lt6911 *lt, u8 bank, u8 reg, u8 *data,
 	ret = i2c_smbus_read_i2c_block_data(lt->client, reg, len, data);
 	if (ret < 0)
 		goto err;
+	if (ret != len) {
+		ret = -EIO;
+		goto err;
+	}
 
 	return 0;
 err:
@@ -533,11 +552,15 @@ static int lt6911_write_sys_seq(struct lt6911 *lt,
 
 static int lt6911_enable(struct lt6911 *lt)
 {
+	if (lt->chip == LT6911_CHIP_D)
+		return 0;
 	return lt6911_write(lt, LT6911_BANK_SYS, LT6911_SYS_ENABLE, 0x01);
 }
 
 static int lt6911_disable(struct lt6911 *lt)
 {
+	if (lt->chip == LT6911_CHIP_D)
+		return 0;
 	return lt6911_write(lt, LT6911_BANK_SYS, LT6911_SYS_ENABLE, 0x00);
 }
 
@@ -548,33 +571,70 @@ static int lt6911_disable(struct lt6911 *lt)
  */
 static int lt6911_disable_watchdog(struct lt6911 *lt)
 {
+	if (lt->chip != LT6911_CHIP_UXC)
+		return 0;
 	return lt6911_write(lt, LT6911_BANK_SYS2, LT6911_SYS2_WATCHDOG, 0x00);
+}
+
+static const char *lt6911_chip_name(struct lt6911 *lt)
+{
+	switch (lt->chip) {
+	case LT6911_CHIP_UXC: return "lt6911uxc";
+	case LT6911_CHIP_C: return "lt6911c";
+	case LT6911_CHIP_D: return "lt6911d";
+	default: return "unknown";
+	}
 }
 
 static int lt6911_check_chip_id(struct lt6911 *lt)
 {
 	unsigned int i;
-	u8 id[3];
+	u8 id[4];
 	int ret;
 
 	ret = lt6911_enable(lt);
 	if (ret)
 		return ret;
 
-	for (i = 0; i < ARRAY_SIZE(id); i++) {
+	for (i = 0; i < 3; i++) {
 		ret = lt6911_read(lt, LT6911_BANK_SYS3,
 				  LT6911_SYS3_CHIP_ID + i, &id[i]);
 		if (ret)
 			return ret;
 	}
 
-	if (id[0] != 0x17 || id[1] != 0x04 || id[2] != 0x83) {
-		dev_err(lt->dev, "not an LT6911UXC: ID %02x %02x %02x\n",
-			id[0], id[1], id[2]);
-		return -ENODEV;
+	if (id[0] == 0x17 && id[1] == 0x04 && id[2] == 0x83) {
+		lt->chip = LT6911_CHIP_UXC;
+		goto found;
 	}
 
-	dev_info(lt->dev, "LT6911UXC found\n");
+	for (i = 0; i < 2; i++) {
+		ret = lt6911_read(lt, LT6911C_BANK_ID, i, &id[i]);
+		if (ret)
+			return ret;
+	}
+	if (id[0] == 0x16 && id[1] == 0x05) {
+		lt->chip = LT6911_CHIP_C;
+		goto found;
+	}
+
+	ret = lt6911_write(lt, LT6911D_BANK_MANAGE, 0xee, 0x01);
+	if (ret)
+		return ret;
+	for (i = 0; i < ARRAY_SIZE(id); i++) {
+		ret = lt6911_read(lt, LT6911D_BANK_MANAGE, 0x80 + i, &id[i]);
+		if (ret)
+			return ret;
+	}
+	if (id[0] == 0x25 && id[1] == 0x10 &&
+	    id[2] == 0x23 && id[3] == 0x01) {
+		lt->chip = LT6911_CHIP_D;
+		goto found;
+	}
+	dev_err(lt->dev, "unknown LT6911 chip (D ID %*ph)\n", 4, id);
+	return -ENODEV;
+found:
+	dev_info(lt->dev, "%s found\n", lt6911_chip_name(lt));
 	return 0;
 }
 
@@ -691,12 +751,65 @@ static int lt6911_power_cycle(struct lt6911 *lt)
 
 /* --- signal state -------------------------------------------------------- */
 
+/* HDMI dimensions are candidates; published CSI dimensions remain separate. */
+static int lt6911_get_rx_geometry(struct lt6911 *lt, u16 *width, u16 *height)
+{
+	u16 half_width;
+	int ret;
+	u8 bank = LT6911_BANK_HDMI;
+	u8 hreg = LT6911_HDMI_RX_HALF_HACTIVE;
+	u8 vreg = LT6911_HDMI_RX_VACTIVE;
+
+	if (lt->chip == LT6911_CHIP_D) {
+		bank = LT6911D_BANK_MANAGE;
+		hreg = 0x8c;
+		vreg = 0x8e;
+	} else if (lt->chip == LT6911_CHIP_C) {
+		ret = lt6911_write(lt, LT6911C_BANK_HDMI, 0x83, 0x11);
+		if (ret)
+			return ret;
+		msleep(5);
+		ret = lt6911_read_be16(lt, LT6911C_BANK_HDMI, 0x8b, width);
+		if (ret)
+			return ret;
+		return lt6911_read_be16(lt, LT6911C_BANK_HDMI, 0x96, height);
+	}
+	ret = lt6911_read_be16(lt, bank, hreg, &half_width);
+	if (ret)
+		return ret;
+	if (half_width > U16_MAX / 2)
+		return -ERANGE;
+	*width = half_width * 2;
+	return lt6911_read_be16(lt, bank, vreg, height);
+}
+
 /* Caller holds lt->chip_lock. */
 static int lt6911_get_signal_state(struct lt6911 *lt, enum lt6911_video *video,
 				   bool *audio)
 {
+	u16 width, height, rate;
 	u8 val;
 	int ret;
+
+	if (lt->chip != LT6911_CHIP_UXC) {
+		ret = lt6911_get_rx_geometry(lt, &width, &height);
+		if (ret)
+			return ret;
+		*video = width && height ? LT6911_VIDEO_STABLE : LT6911_VIDEO_GONE;
+		if (lt->chip == LT6911_CHIP_C) {
+			/* SDK has no C audio-presence flag; it reports rate only. */
+			ret = lt6911_read(lt, LT6911C_BANK_AUDIO, 0x55, &val);
+			if (ret)
+				return ret;
+			rate = val;
+		} else {
+			ret = lt6911_read_be16(lt, LT6911D_BANK_MANAGE, 0x90, &rate);
+		}
+		if (ret)
+			return ret;
+		*audio = width && height && rate;
+		return 0;
+	}
 
 	ret = lt6911_write(lt, LT6911_BANK_HDMI, LT6911_HDMI_ENABLE, 0x00);
 	if (ret)
@@ -798,6 +911,15 @@ static int lt6911_get_res(struct lt6911 *lt, u16 *width, u16 *height)
 {
 	int ret;
 
+	if (lt->chip == LT6911_CHIP_D)
+		return lt6911_get_rx_geometry(lt, width, height);
+	if (lt->chip == LT6911_CHIP_C) {
+		ret = lt6911_read_be16(lt, LT6911C_BANK_CSI, 0x06, height);
+		if (ret)
+			return ret;
+		return lt6911_read_be16(lt, LT6911C_BANK_CSI, 0x38, width);
+	}
+
 	ret = lt6911_read_be16(lt, LT6911_BANK_CSI, LT6911_CSI_VACTIVE,
 			       height);
 	if (ret)
@@ -819,33 +941,50 @@ static int lt6911_get_res(struct lt6911 *lt, u16 *width, u16 *height)
 static int lt6911_get_fps(struct lt6911 *lt, u16 *fps)
 {
 	u16 htotal, vtotal;
+	u32 full_htotal;
 	unsigned int i;
 	u8 val[3];
+	u8 bank = LT6911_BANK_CSI;
+	u8 clock_reg = LT6911_CSI_HALF_PCLK;
 	u32 clk;
 	int ret;
 
-	ret = lt6911_read_be16(lt, LT6911_BANK_CSI_TOTAL, LT6911_TOTAL_HTOTAL,
+	if (lt->chip == LT6911_CHIP_C) {
+		/* The SDK cannot measure C frame rate. Never invent a register map. */
+		*fps = 0;
+		return 0;
+	}
+	if (lt->chip == LT6911_CHIP_D) {
+		bank = LT6911D_BANK_MANAGE;
+		clock_reg = 0x85;
+		ret = lt6911_read_be16(lt, bank, 0x88, &htotal);
+		if (ret)
+			return ret;
+		ret = lt6911_read_be16(lt, bank, 0x8a, &vtotal);
+	} else {
+		ret = lt6911_read_be16(lt, LT6911_BANK_CSI_TOTAL, LT6911_TOTAL_HTOTAL,
 			       &htotal);
-	if (ret)
-		return ret;
-	ret = lt6911_read_be16(lt, LT6911_BANK_CSI_TOTAL, LT6911_TOTAL_VTOTAL,
+		if (ret)
+			return ret;
+		ret = lt6911_read_be16(lt, LT6911_BANK_CSI_TOTAL, LT6911_TOTAL_VTOTAL,
 			       &vtotal);
+	}
 	if (ret)
 		return ret;
 
 	msleep(20);
 
-	ret = lt6911_write(lt, LT6911_BANK_CSI, LT6911_CSI_MEASURE,
+	if (lt->chip == LT6911_CHIP_UXC) {
+		ret = lt6911_write(lt, LT6911_BANK_CSI, LT6911_CSI_MEASURE,
 			   LT6911_CSI_MEASURE_START);
-	if (ret)
-		return ret;
+		if (ret)
+			return ret;
 
-	/* The vendor's msleep(10); a short sleep wants a bounded one. */
-	usleep_range(10000, 15000);
+		usleep_range(10000, 15000);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(val); i++) {
-		ret = lt6911_read(lt, LT6911_BANK_CSI,
-				  LT6911_CSI_HALF_PCLK + i, &val[i]);
+		ret = lt6911_read(lt, bank, clock_reg + i, &val[i]);
 		if (ret)
 			return ret;
 	}
@@ -865,11 +1004,215 @@ static int lt6911_get_fps(struct lt6911 *lt, u16 *fps)
 		return 0;
 	}
 
-	*fps = (clk * 2000U) / ((u32)htotal * vtotal);
+	full_htotal = (u32)htotal * (lt->chip == LT6911_CHIP_D ? 2 : 1);
+	*fps = div64_u64((u64)clk * 2000, (u64)full_htotal * vtotal);
 	return 0;
 }
 
 /* --- serial flash: EDID and version string ------------------------------- */
+
+/*
+ * D has a different flash controller, including command delays and an E1
+ * FIFO reset. Keep it separate: substituting E0 into the UXC sequences is
+ * not equivalent. These sequences follow Sipeed SDK v0.0.32 verbatim.
+ */
+struct lt6911d_step {
+	u8 reg;
+	u8 val;
+	u16 delay_ms;
+};
+
+static int lt6911d_seq(struct lt6911 *lt, const struct lt6911d_step *seq,
+		       size_t count)
+{
+	size_t i;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		ret = lt6911_write(lt, LT6911D_BANK_MANAGE, seq[i].reg, seq[i].val);
+		if (ret)
+			return ret;
+		if (seq[i].delay_ms)
+			msleep(seq[i].delay_ms);
+	}
+	return 0;
+}
+
+static int lt6911d_flash_begin(struct lt6911 *lt)
+{
+	static const struct lt6911d_step seq[] = {
+		{ 0xee, 0x01, 0 }, { 0x5e, 0xdf, 0 }, { 0x58, 0x00, 0 },
+		{ 0x59, 0x50, 0 }, { 0x5a, 0x10, 1 }, { 0x5a, 0x00, 0 },
+		{ 0x58, 0x21, 0 },
+	};
+
+	return lt6911d_seq(lt, seq, ARRAY_SIZE(seq));
+}
+
+static int lt6911d_flash_end(struct lt6911 *lt)
+{
+	static const struct lt6911d_step seq[] = {
+		{ 0x5a, 0x08, 1 }, { 0x5a, 0x00, 0 }, { 0x58, 0x00, 0 },
+	};
+
+	return lt6911d_seq(lt, seq, ARRAY_SIZE(seq));
+}
+
+static int lt6911d_flash_reset_fifo(struct lt6911 *lt)
+{
+	static const struct lt6911d_step seq[] = {
+		{ 0x5a, 0x04, 1 }, { 0x5a, 0x00, 0 },
+	};
+	int ret;
+
+	ret = lt6911_write(lt, LT6911D_BANK_DATA, 0x03, 0xbf);
+	if (ret)
+		return ret;
+	msleep(1);
+	ret = lt6911_write(lt, LT6911D_BANK_DATA, 0x03, 0xff);
+	if (ret)
+		return ret;
+	return lt6911d_seq(lt, seq, ARRAY_SIZE(seq));
+}
+
+static int lt6911d_flash_addr(struct lt6911 *lt, u8 hi, u8 lo)
+{
+	const struct lt6911d_step seq[] = {
+		{ 0x5b, 0x00, 0 }, { 0x5c, hi, 0 }, { 0x5d, lo, 0 },
+	};
+
+	return lt6911d_seq(lt, seq, ARRAY_SIZE(seq));
+}
+
+/* Page 80xx is EDID, 8100 the board string. No firmware pages are touched. */
+static int lt6911d_flash_read(struct lt6911 *lt, u8 hi, u8 *data, size_t size)
+{
+	static const struct lt6911d_step pre[] = {
+		{ 0x5e, 0x5f, 0 }, { 0x5a, 0x20, 1 }, { 0x5a, 0x00, 0 },
+	};
+	static const struct lt6911d_step read[] = {
+		{ 0x5a, 0x10, 1 }, { 0x5a, 0x00, 0 },
+	};
+	size_t offset;
+	int ret, end_ret;
+
+	ret = lt6911d_flash_begin(lt);
+	if (ret)
+		goto out;
+	for (offset = 0; offset < size; offset += LT6911_FLASH_PAGE) {
+		ret = lt6911d_flash_reset_fifo(lt);
+		if (ret)
+			goto out;
+		ret = lt6911d_seq(lt, pre, ARRAY_SIZE(pre));
+		if (ret)
+			goto out;
+		ret = lt6911d_flash_addr(lt, hi, offset);
+		if (ret)
+			goto out;
+		ret = lt6911d_seq(lt, read, ARRAY_SIZE(read));
+		if (ret)
+			goto out;
+		ret = lt6911_read_block(lt, LT6911D_BANK_MANAGE, 0x5f,
+					data + offset, LT6911_FLASH_PAGE);
+		if (ret)
+			goto out;
+		msleep(10);
+	}
+out:
+	end_ret = lt6911d_flash_end(lt);
+	return ret ? ret : end_ret;
+}
+
+static int lt6911d_flash_erase(struct lt6911 *lt, u8 hi)
+{
+	static const struct lt6911d_step reset[] = {
+		{ 0x5a, 0x04, 1 }, { 0x5a, 0x00, 0 },
+	};
+	static const struct lt6911d_step erase[] = {
+		{ 0x5a, 0x01, 1 }, { 0x5a, 0x00, 600 },
+	};
+	int ret;
+
+	ret = lt6911d_flash_begin(lt);
+	if (ret)
+		return ret;
+	ret = lt6911d_seq(lt, reset, ARRAY_SIZE(reset));
+	if (ret)
+		return ret;
+	ret = lt6911d_flash_addr(lt, hi, 0);
+	if (ret)
+		return ret;
+	return lt6911d_seq(lt, erase, ARRAY_SIZE(erase));
+}
+
+static int lt6911d_flash_write_page(struct lt6911 *lt, u8 hi, u8 lo,
+				    const u8 *data, u8 size)
+{
+	static const struct lt6911d_step pre[] = {
+		{ 0x5e, 0xdf, 0 }, { 0x5a, 0x20, 1 }, { 0x5a, 0x00, 0 },
+		{ 0x58, 0x21, 0 },
+	};
+	static const struct lt6911d_step program[] = {
+		{ 0x5a, 0x10, 5 }, { 0x5a, 0x00, 10 },
+	};
+	int ret;
+
+	ret = lt6911d_flash_reset_fifo(lt);
+	if (ret)
+		return ret;
+	ret = lt6911d_seq(lt, pre, ARRAY_SIZE(pre));
+	if (ret)
+		return ret;
+	ret = lt6911_write_block(lt, LT6911D_BANK_MANAGE, 0x59, data, size);
+	if (ret)
+		return ret;
+	ret = lt6911d_flash_addr(lt, hi, lo);
+	if (ret)
+		return ret;
+	return lt6911d_seq(lt, program, ARRAY_SIZE(program));
+}
+
+static int lt6911d_write_metadata(struct lt6911 *lt, const u8 *edid,
+				 const u8 *version)
+{
+	u8 verify[LT6911_VERSION_SIZE];
+	int ret, end_ret, offset;
+
+	ret = lt6911d_flash_erase(lt, 0x80);
+	if (ret)
+		goto out;
+	for (offset = 0; offset < LT6911_EDID_SIZE; offset += LT6911_FLASH_PAGE) {
+		ret = lt6911d_flash_write_page(lt, 0x80, offset,
+					       edid + offset, LT6911_FLASH_PAGE);
+		if (ret)
+			goto out;
+	}
+	ret = lt6911d_flash_write_page(lt, 0x81, 0, version, LT6911_VERSION_SIZE);
+out:
+	end_ret = lt6911d_flash_end(lt);
+	if (ret || end_ret)
+		return ret ? ret : end_ret;
+	ret = lt6911d_flash_read(lt, 0x81, verify, sizeof(verify));
+	if (ret)
+		return ret;
+	if (memcmp(version, verify, sizeof(verify))) {
+		dev_err(lt->dev, "board string changed during EDID write\n");
+		return -EIO;
+	}
+	return 0;
+}
+
+static int lt6911d_edid_write(struct lt6911 *lt, const u8 *edid)
+{
+	u8 version[LT6911_VERSION_SIZE];
+	int ret;
+
+	/* Preserve the raw board string, including erased/padding bytes. */
+	ret = lt6911d_flash_read(lt, 0x81, version, sizeof(version));
+	if (ret)
+		return ret;
+	return lt6911d_write_metadata(lt, edid, version);
+}
 
 /*
  * The LT6911UXC keeps the EDID it presents to the attached host, plus a
@@ -1031,6 +1374,12 @@ static int lt6911_version_read(struct lt6911 *lt, char *str)
 {
 	int ret, i;
 
+	if (lt->chip == LT6911_CHIP_C)
+		return -EOPNOTSUPP;
+	if (lt->chip == LT6911_CHIP_D) {
+		ret = lt6911d_flash_read(lt, 0x81, (u8 *)str, LT6911_VERSION_SIZE);
+		goto finish;
+	}
 	ret = lt6911_write_sys_seq(lt, lt6911_flash_read_seq,
 				   ARRAY_SIZE(lt6911_flash_read_seq));
 	if (ret)
@@ -1038,6 +1387,7 @@ static int lt6911_version_read(struct lt6911 *lt, char *str)
 
 	ret = lt6911_flash_read_page(lt, (u8 *)str, LT6911_VERSION_SIZE,
 				     0x81, 0x00);
+finish:
 	if (ret)
 		return ret;
 
@@ -1074,6 +1424,18 @@ static int lt6911_version_write(struct lt6911 *lt, const u8 *str, u8 len)
 		}
 	}
 
+	if (lt->chip == LT6911_CHIP_D) {
+		u8 edid[LT6911_EDID_SIZE];
+		u8 version[LT6911_VERSION_SIZE] = { 0 };
+
+		/* Metadata can share an erase sector: retain EDID here as well. */
+		ret = lt6911d_flash_read(lt, 0x80, edid, sizeof(edid));
+		if (ret)
+			return ret;
+		memcpy(version, str, len);
+		return lt6911d_write_metadata(lt, edid, version);
+	}
+
 	ret = lt6911_write_sys_seq(lt, lt6911_flash_erase_seq,
 				   ARRAY_SIZE(lt6911_flash_erase_seq));
 	if (ret)
@@ -1101,6 +1463,11 @@ static int lt6911_version_write(struct lt6911 *lt, const u8 *str, u8 len)
 static int lt6911_edid_read(struct lt6911 *lt, u8 *edid)
 {
 	int ret, i;
+
+	if (lt->chip == LT6911_CHIP_C)
+		return -EOPNOTSUPP;
+	if (lt->chip == LT6911_CHIP_D)
+		return lt6911d_flash_read(lt, 0x80, edid, LT6911_EDID_SIZE);
 
 	ret = lt6911_write_sys_seq(lt, lt6911_flash_read_seq,
 				   ARRAY_SIZE(lt6911_flash_read_seq));
@@ -1130,6 +1497,11 @@ static int lt6911_edid_write(struct lt6911 *lt, const u8 *edid)
 {
 	char version[LT6911_VERSION_SIZE + 1];
 	int ret, i;
+
+	if (lt->chip == LT6911_CHIP_C)
+		return -EOPNOTSUPP;
+	if (lt->chip == LT6911_CHIP_D)
+		return lt6911d_edid_write(lt, edid);
 
 	ret = lt6911_version_read(lt, version);
 	if (ret)
@@ -1230,7 +1602,7 @@ static int lt6911_video_stable(struct lt6911 *lt)
 {
 	u16 width = 0, height = 0, fps = 0;
 	enum lt6911_res res;
-	u8 hdcp = 0;
+	u8 hdcp = 0xff;
 	int ret;
 
 	ret = lt6911_get_res(lt, &width, &height);
@@ -1263,9 +1635,11 @@ static int lt6911_video_stable(struct lt6911 *lt)
 	lt6911_set_text(&lt->height, "%d\n", height);
 	mutex_unlock(&lt->buf_lock);
 
-	ret = lt6911_read(lt, LT6911_BANK_HDMI, LT6911_HDMI_HDCP, &hdcp);
-	if (ret)
-		return ret;
+	if (lt->chip == LT6911_CHIP_UXC) {
+		ret = lt6911_read(lt, LT6911_BANK_HDMI, LT6911_HDMI_HDCP, &hdcp);
+		if (ret)
+			return ret;
+	}
 
 	mutex_lock(&lt->buf_lock);
 	switch (hdcp) {
@@ -1305,7 +1679,8 @@ static void lt6911_video_lost(struct lt6911 *lt, bool known)
 	lt6911_set_text(&lt->width, "%d\n", 0);
 	lt6911_set_text(&lt->height, "%d\n", 0);
 	lt6911_set_text(&lt->fps, "%d\n", 0);
-	lt6911_set_text(&lt->hdcp, known ? "no hdcp\n" : "unknown hdcp\n");
+	lt6911_set_text(&lt->hdcp, known && lt->chip == LT6911_CHIP_UXC ?
+			 "no hdcp\n" : "unknown hdcp\n");
 	mutex_unlock(&lt->buf_lock);
 
 	lt6911_bump_status(lt);
@@ -1321,6 +1696,8 @@ static void lt6911_video_lost(struct lt6911 *lt, bool known)
 static void lt6911_audio_update(struct lt6911 *lt, bool present)
 {
 	u16 rate;
+	u8 val;
+	int ret;
 
 	if (!present) {
 		mutex_lock(&lt->buf_lock);
@@ -1329,8 +1706,19 @@ static void lt6911_audio_update(struct lt6911 *lt, bool present)
 		return;
 	}
 
-	if (lt6911_read_be16(lt, LT6911_BANK_AUDIO, LT6911_AUDIO_SAMPLE_RATE,
-			     &rate)) {
+	if (lt->chip == LT6911_CHIP_D) {
+		ret = lt6911_read_be16(lt, LT6911D_BANK_MANAGE, 0x90, &rate);
+	} else if (lt->chip == LT6911_CHIP_C) {
+		ret = lt6911_read(lt, LT6911C_BANK_AUDIO, 0x55, &val);
+		if (!ret)
+			rate = val;
+	} else {
+		ret = lt6911_read_be16(lt, LT6911_BANK_AUDIO,
+				       LT6911_AUDIO_SAMPLE_RATE, &rate);
+		if (!ret)
+			rate += LT6911_AUDIO_SAMPLE_RATE_BIAS;
+	}
+	if (ret) {
 		mutex_lock(&lt->buf_lock);
 		lt6911_set_text(&lt->asr, "unknown\n");
 		mutex_unlock(&lt->buf_lock);
@@ -1338,7 +1726,7 @@ static void lt6911_audio_update(struct lt6911 *lt, bool present)
 	}
 
 	mutex_lock(&lt->buf_lock);
-	lt6911_set_text(&lt->asr, "%u\n", rate + LT6911_AUDIO_SAMPLE_RATE_BIAS);
+	lt6911_set_text(&lt->asr, "%u\n", rate);
 	mutex_unlock(&lt->buf_lock);
 }
 
@@ -1403,8 +1791,10 @@ static void lt6911_detect_work_fn(struct work_struct *work)
 static irqreturn_t lt6911_int_thread(int irq, void *data)
 {
 	struct lt6911 *lt = data;
+	int asserted = gpiod_get_value_cansleep(lt->int_gpio);
 
-	if (gpiod_get_value_cansleep(lt->int_gpio) > 0)
+	/* DT is active-low for the board's UXC/D; C signals on the other edge. */
+	if (asserted >= 0 && !!asserted == (lt->chip != LT6911_CHIP_C))
 		schedule_work(&lt->info_work);
 
 	return IRQ_HANDLED;
@@ -1440,9 +1830,11 @@ LT6911_TEXT_READ_OP(loopout_power, loopout_power)
 static ssize_t lt6911_chip_id_read(struct file *file, char __user *ubuf,
 				   size_t count, loff_t *ppos)
 {
-	static const char id[] = "lt6911uxc\n";
+	struct lt6911 *lt = pde_data(file_inode(file));
+	char id[16];
+	int len = scnprintf(id, sizeof(id), "%s\n", lt6911_chip_name(lt));
 
-	return simple_read_from_buffer(ubuf, count, ppos, id, strlen(id));
+	return simple_read_from_buffer(ubuf, count, ppos, id, len);
 }
 
 /*
@@ -1456,7 +1848,7 @@ static ssize_t lt6911_rx_geometry_read(struct file *file, char __user *ubuf,
 {
 	struct lt6911 *lt = pde_data(file_inode(file));
 	char text[24];
-	u16 half_width = 0, height = 0;
+	u16 width = 0, height = 0;
 	int ret, disable_ret;
 
 	if (*ppos)
@@ -1466,11 +1858,7 @@ static ssize_t lt6911_rx_geometry_read(struct file *file, char __user *ubuf,
 		return ret;
 	ret = lt6911_enable(lt);
 	if (!ret) {
-		ret = lt6911_read_be16(lt, LT6911_BANK_HDMI,
-					LT6911_HDMI_RX_HALF_HACTIVE, &half_width);
-		if (!ret)
-			ret = lt6911_read_be16(lt, LT6911_BANK_HDMI,
-						LT6911_HDMI_RX_VACTIVE, &height);
+		ret = lt6911_get_rx_geometry(lt, &width, &height);
 		disable_ret = lt6911_disable(lt);
 		if (!ret)
 			ret = disable_ret;
@@ -1480,7 +1868,7 @@ static ssize_t lt6911_rx_geometry_read(struct file *file, char __user *ubuf,
 		return ret;
 
 	ret = scnprintf(text, sizeof(text), "%u %u\n",
-			(unsigned int)half_width * 2, height);
+			(unsigned int)width, height);
 	return simple_read_from_buffer(ubuf, count, ppos, text, ret);
 }
 
@@ -1497,7 +1885,15 @@ static ssize_t lt6911_power_write(struct file *file, const char __user *ubuf,
 	if (ret)
 		return ret;
 
+	/* Do not let an IRQ worker access I2C while the rail is changing or
+	 * the bridge firmware is still starting. Probe uses the same settle
+	 * interval before its final state read.
+	 */
+	mutex_lock(&lt->chip_lock);
 	ret = lt6911_set_power(lt, on);
+	if (!ret && on)
+		msleep(300);
+	mutex_unlock(&lt->chip_lock);
 	if (ret)
 		return -EIO;
 
@@ -1510,6 +1906,9 @@ static ssize_t lt6911_power_write(struct file *file, const char __user *ubuf,
 		lt6911_set_text(&lt->status, "disappear\n");
 		mutex_unlock(&lt->buf_lock);
 		lt6911_bump_status(lt);
+	} else {
+		/* Re-read even if the power transition coalesced the IRQ edge. */
+		schedule_work(&lt->info_work);
 	}
 
 	return count;
@@ -1743,6 +2142,9 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 	s64 age;
 	int ret;
 
+	if (lt->chip == LT6911_CHIP_C)
+		return -EOPNOTSUPP;
+
 	mutex_lock(&lt->chip_lock);
 
 	age = ktime_to_ms(ktime_sub(now, lt->edid_read_ts));
@@ -1789,6 +2191,9 @@ static ssize_t lt6911_edid_proc_write(struct file *file,
 	struct lt6911 *lt = pde_data(file_inode(file));
 	u8 *wbuf, *rbuf;
 	int ret;
+
+	if (lt->chip == LT6911_CHIP_C)
+		return -EOPNOTSUPP;
 
 	/*
 	 * The Go server writes the whole 256-byte image in one syscall, and
@@ -2099,8 +2504,14 @@ static int lt6911_proc_init(struct lt6911 *lt)
 		return -ENOMEM;
 
 	for (i = 0; i < ARRAY_SIZE(lt6911_proc_files); i++) {
+		umode_t mode = lt6911_proc_files[i].mode;
+
+		if (lt->chip == LT6911_CHIP_C &&
+		    (!strcmp(lt6911_proc_files[i].name, "edid") ||
+		     !strcmp(lt6911_proc_files[i].name, "version")))
+			mode = 0444;
 		if (!proc_create_data(lt6911_proc_files[i].name,
-				      lt6911_proc_files[i].mode,
+				      mode,
 				      lt->proc_dir,
 				      lt6911_proc_files[i].ops, lt)) {
 			proc_remove(lt->proc_dir);
@@ -2134,7 +2545,7 @@ static void lt6911_init_text(struct lt6911 *lt)
 	lt6911_set_text(&lt->width, "%d\n", 0);
 	lt6911_set_text(&lt->height, "%d\n", 0);
 	lt6911_set_text(&lt->fps, "%d\n", 0);
-	lt6911_set_text(&lt->hdcp, "no hdcp\n");
+	lt6911_set_text(&lt->hdcp, "unknown hdcp\n");
 	lt6911_set_text(&lt->asr, "disappear\n");
 	mutex_unlock(&lt->buf_lock);
 }
@@ -2337,7 +2748,7 @@ static int lt6911_probe(struct i2c_client *client)
 	mutex_lock(&lt6911_instance_lock);
 	if (lt6911_instance) {
 		mutex_unlock(&lt6911_instance_lock);
-		dev_err(dev, "a second LT6911UXC cannot share /proc\n");
+		dev_err(dev, "a second LT6911 cannot share /proc\n");
 		ret = -EBUSY;
 		goto err_power;
 	}
@@ -2459,12 +2870,16 @@ static void lt6911_remove(struct i2c_client *client)
 
 static const struct of_device_id lt6911_of_match[] = {
 	{ .compatible = "lontium,lt6911uxc" },
+	{ .compatible = "lontium,lt6911c" },
+	{ .compatible = "lontium,lt6911d" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, lt6911_of_match);
 
 static const struct i2c_device_id lt6911_i2c_id[] = {
 	{ "lt6911uxc" },
+	{ "lt6911c" },
+	{ "lt6911d" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, lt6911_i2c_id);
@@ -2480,5 +2895,6 @@ static struct i2c_driver lt6911_driver = {
 };
 module_i2c_driver(lt6911_driver);
 
-MODULE_DESCRIPTION("Lontium LT6911UXC management for NanoKVM-Pro");
+MODULE_DESCRIPTION("Lontium LT6911C/UXC/D management for NanoKVM-Pro");
+MODULE_ALIAS("lt6911uxc");
 MODULE_LICENSE("GPL");
