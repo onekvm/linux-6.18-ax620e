@@ -21,8 +21,9 @@
  * (GPL-2.0), which this replaces. Boards sold as NanoKVM Pro can carry any
  * of its three bridge variants. Probe their actual register IDs instead of
  * inferring the silicon from the board name or DT's historical UXC spelling.
- * LT6911C retains the vendor's limited capabilities: no flash operations,
- * measured frame rate or HDCP reporting. The AX-Pi board is not supported.
+ * LT6911C uses the maintained NanoKVM C flash protocol for guarded EDID
+ * operations. Measured frame rate and HDCP reporting remain unavailable.
+ * The AX-Pi board is not supported.
  *
  * Differences from the vendor driver that are fixes, not preferences, are
  * marked "vendor bug" at the point where they matter.
@@ -1012,6 +1013,264 @@ static int lt6911_get_fps(struct lt6911 *lt, u16 *fps)
 /* --- serial flash: EDID and version string ------------------------------- */
 
 /*
+ * C flash protocol from the maintained NanoKVM MMF C EDID implementation.
+ * Pages are 16 bytes; the controller strobes and ACK differ from UXC/D.
+ * EDID is at 0x18000. Preserve the upper 64 KiB bank to cover both 4 KiB
+ * and 64 KiB addressed erase variants. The actual Pro C erase extent still
+ * needs hardware validation; initialization never invokes this writer.
+ * Refuse nonblank data before EDID in that bank; the SDK does not define
+ * a Pro C version string. The backup is in RAM, not power-loss recovery.
+ */
+#define LT6911C_FLASH_PAGE 16
+#define LT6911C_METADATA_BANK 0x10000
+#define LT6911C_METADATA_SIZE 0x10000
+#define LT6911C_EDID_OFFSET 0x8000
+
+static int lt6911_check_edid(struct lt6911 *lt, const u8 *edid, size_t len);
+
+static int lt6911c_flash_end(struct lt6911 *lt)
+{
+	int ret, disable_ret;
+
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x82);
+	disable_ret = lt6911_disable(lt);
+	return ret ? ret : disable_ret;
+}
+
+static int lt6911c_flash_address(struct lt6911 *lt, unsigned int offset)
+{
+	int ret;
+
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5b, offset >> 16);
+	if (ret)
+		return ret;
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5c, offset >> 8);
+	if (ret)
+		return ret;
+	return lt6911_write(lt, LT6911_BANK_SYS, 0x5d, offset);
+}
+
+static int lt6911c_flash_read(struct lt6911 *lt, unsigned int offset,
+			     u8 *data, size_t size)
+{
+	static const struct lt6911_regval begin[] = {
+		{ 0xee, 0x01 }, { 0x5a, 0x86 }, { 0x5a, 0x82 },
+	};
+	static const struct lt6911_regval pre[] = {
+		{ 0x5e, 0x6f }, { 0x5a, 0xa2 }, { 0x5a, 0x82 },
+	};
+	size_t i;
+	int ret, end_ret;
+
+	if (offset < LT6911C_METADATA_BANK ||
+	    offset >= LT6911C_METADATA_BANK + LT6911C_METADATA_SIZE ||
+	    size > LT6911C_METADATA_BANK + LT6911C_METADATA_SIZE - offset ||
+	    offset % LT6911C_FLASH_PAGE || !size || size % LT6911C_FLASH_PAGE)
+		return -EINVAL;
+	ret = lt6911_write_sys_seq(lt, begin, ARRAY_SIZE(begin));
+	if (ret)
+		goto out;
+	for (i = 0; i < size; i += LT6911C_FLASH_PAGE) {
+		ret = lt6911_write_sys_seq(lt, pre, ARRAY_SIZE(pre));
+		if (ret)
+			goto out;
+		ret = lt6911c_flash_address(lt, offset + i);
+		if (ret)
+			goto out;
+		ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x92);
+		if (ret)
+			goto out;
+		usleep_range(1000, 1500);
+		ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x82);
+		if (ret)
+			goto out;
+		ret = lt6911_write(lt, LT6911_BANK_SYS, 0x58, 0x01);
+		if (ret)
+			goto out;
+		ret = lt6911_read_block(lt, LT6911_BANK_SYS, 0x5f,
+					data + i, LT6911C_FLASH_PAGE);
+		if (ret)
+			goto out;
+	}
+out:
+	end_ret = lt6911c_flash_end(lt);
+	return ret ? ret : end_ret;
+}
+
+static int lt6911c_flash_ack(struct lt6911 *lt)
+{
+	u8 status;
+	int ret;
+
+	ret = lt6911_read(lt, LT6911_BANK_SYS2, 0x02, &status);
+	if (ret)
+		return ret;
+	if (status != 0xff)
+		return -EIO;
+	ret = lt6911_write(lt, LT6911_BANK_SYS2, 0x02, 0xdf);
+	if (ret)
+		return ret;
+	return lt6911_write(lt, LT6911_BANK_SYS2, 0x02, 0xff);
+}
+
+static int lt6911c_flash_prepare(struct lt6911 *lt)
+{
+	static const struct lt6911_regval begin[] = {
+		{ 0xee, 0x01 }, { 0x5a, 0x82 }, { 0x5e, 0xc0 },
+		{ 0x58, 0x00 }, { 0x59, 0x51 }, { 0x5a, 0x92 },
+		{ 0x5a, 0x82 }, { 0x5a, 0x86 }, { 0x5a, 0x82 },
+	};
+	u16 id;
+	int ret;
+
+	ret = lt6911_enable(lt);
+	if (ret)
+		return ret;
+	ret = lt6911_read_be16(lt, LT6911C_BANK_ID, 0x00, &id);
+	if (ret)
+		return ret;
+	if (id != 0x1605)
+		return -ENODEV;
+	ret = lt6911c_flash_ack(lt);
+	if (ret)
+		return ret;
+	ret = lt6911_write_sys_seq(lt, begin, ARRAY_SIZE(begin));
+	if (ret)
+		return ret;
+	msleep(50);
+	return lt6911c_flash_ack(lt);
+}
+
+static int lt6911c_flash_erase(struct lt6911 *lt)
+{
+	int ret;
+
+	ret = lt6911c_flash_address(lt, LT6911C_METADATA_BANK + LT6911C_EDID_OFFSET);
+	if (ret)
+		return ret;
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x83);
+	if (ret)
+		return ret;
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x82);
+	if (ret)
+		return ret;
+	msleep(500);
+	return lt6911c_flash_ack(lt);
+}
+
+static int lt6911c_flash_write_page(struct lt6911 *lt, unsigned int offset,
+				  const u8 *data)
+{
+	static const struct lt6911_regval pre[] = {
+		{ 0x5a, 0x82 }, { 0x5a, 0x86 }, { 0x5a, 0x82 },
+		{ 0x5e, 0xef }, { 0x5a, 0xa2 }, { 0x5a, 0x82 },
+		{ 0x58, 0x01 },
+	};
+	int ret;
+
+	if (offset < 0x18000 || offset >= 0x20000 || offset % LT6911C_FLASH_PAGE)
+		return -EINVAL;
+	ret = lt6911_write_sys_seq(lt, pre, ARRAY_SIZE(pre));
+	if (ret)
+		return ret;
+	ret = lt6911_write_block(lt, LT6911_BANK_SYS, 0x59, data, LT6911C_FLASH_PAGE);
+	if (ret)
+		return ret;
+	ret = lt6911c_flash_address(lt, offset);
+	if (ret)
+		return ret;
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5e, 0xe0);
+	if (ret)
+		return ret;
+	ret = lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x92);
+	if (ret)
+		return ret;
+	usleep_range(10000, 15000);
+	return lt6911_write(lt, LT6911_BANK_SYS, 0x5a, 0x82);
+}
+
+static int lt6911c_edid_read(struct lt6911 *lt, u8 *edid)
+{
+	int ret;
+
+	ret = lt6911c_flash_read(lt, 0x18000, edid, LT6911_EDID_SIZE);
+	if (ret)
+		return ret;
+	/* Unknown firmware layouts must not become writable just from a chip ID. */
+	if (edid[126] != 1 || lt6911_check_edid(lt, edid, LT6911_EDID_SIZE))
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+static int lt6911c_edid_write(struct lt6911 *lt, const u8 *edid)
+{
+	static const struct lt6911_regval finish[] = {
+		{ 0x5a, 0x82 }, { 0x5a, 0x8a }, { 0x5a, 0x82 },
+	};
+	u8 *buffer, *before, *verify;
+	unsigned int offset;
+	int ret, end_ret;
+
+	if (edid[126] != 1 || lt6911_check_edid(lt, edid, LT6911_EDID_SIZE))
+		return -EINVAL;
+	buffer = kvmalloc(2 * LT6911C_METADATA_SIZE, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+	before = buffer;
+	verify = buffer + LT6911C_METADATA_SIZE;
+	ret = lt6911c_flash_read(lt, LT6911C_METADATA_BANK, before, LT6911C_METADATA_SIZE);
+	if (ret)
+		goto out;
+	ret = lt6911c_flash_read(lt, LT6911C_METADATA_BANK, verify, LT6911C_METADATA_SIZE);
+	if (ret)
+		goto out;
+	if (memcmp(before, verify, LT6911C_METADATA_SIZE)) {
+		ret = -EIO;
+		goto out;
+	}
+	if (memchr_inv(before, 0xff, LT6911C_EDID_OFFSET) ||
+	    before[LT6911C_EDID_OFFSET + 126] != 1 ||
+	    lt6911_check_edid(lt, before + LT6911C_EDID_OFFSET, LT6911_EDID_SIZE)) {
+		dev_err(lt->dev, "unrecognized C flash layout; EDID left unchanged\n");
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!memcmp(before + LT6911C_EDID_OFFSET, edid, LT6911_EDID_SIZE)) {
+		ret = 0;
+		goto out;
+	}
+	memcpy(before + LT6911C_EDID_OFFSET, edid, LT6911_EDID_SIZE);
+	ret = lt6911c_flash_prepare(lt);
+	if (ret)
+		goto out;
+	ret = lt6911c_flash_erase(lt);
+	if (ret)
+		goto out;
+	for (offset = LT6911C_EDID_OFFSET; offset < LT6911C_METADATA_SIZE;
+	     offset += LT6911C_FLASH_PAGE) {
+		if (!memchr_inv(before + offset, 0xff, LT6911C_FLASH_PAGE))
+			continue;
+		ret = lt6911c_flash_write_page(lt, LT6911C_METADATA_BANK + offset,
+					     before + offset);
+		if (ret)
+			goto out;
+	}
+	ret = lt6911_write_sys_seq(lt, finish, ARRAY_SIZE(finish));
+	if (ret)
+		goto out;
+	ret = lt6911c_flash_ack(lt);
+	if (ret)
+		goto out;
+	ret = lt6911c_flash_read(lt, LT6911C_METADATA_BANK, verify, LT6911C_METADATA_SIZE);
+	if (!ret && memcmp(before, verify, LT6911C_METADATA_SIZE))
+		ret = -EIO;
+out:
+	end_ret = lt6911c_flash_end(lt);
+	kvfree(buffer);
+	return ret ? ret : end_ret;
+}
+
+/*
  * D has a different flash controller, including command delays and an E1
  * FIFO reset. Keep it separate: substituting E0 into the UXC sequences is
  * not equivalent. These sequences follow Sipeed SDK v0.0.32 verbatim.
@@ -1465,7 +1724,7 @@ static int lt6911_edid_read(struct lt6911 *lt, u8 *edid)
 	int ret, i;
 
 	if (lt->chip == LT6911_CHIP_C)
-		return -EOPNOTSUPP;
+		return lt6911c_edid_read(lt, edid);
 	if (lt->chip == LT6911_CHIP_D)
 		return lt6911d_flash_read(lt, 0x80, edid, LT6911_EDID_SIZE);
 
@@ -1499,7 +1758,7 @@ static int lt6911_edid_write(struct lt6911 *lt, const u8 *edid)
 	int ret, i;
 
 	if (lt->chip == LT6911_CHIP_C)
-		return -EOPNOTSUPP;
+		return lt6911c_edid_write(lt, edid);
 	if (lt->chip == LT6911_CHIP_D)
 		return lt6911d_edid_write(lt, edid);
 
@@ -2142,9 +2401,6 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 	s64 age;
 	int ret;
 
-	if (lt->chip == LT6911_CHIP_C)
-		return -EOPNOTSUPP;
-
 	mutex_lock(&lt->chip_lock);
 
 	age = ktime_to_ms(ktime_sub(now, lt->edid_read_ts));
@@ -2191,9 +2447,6 @@ static ssize_t lt6911_edid_proc_write(struct file *file,
 	struct lt6911 *lt = pde_data(file_inode(file));
 	u8 *wbuf, *rbuf;
 	int ret;
-
-	if (lt->chip == LT6911_CHIP_C)
-		return -EOPNOTSUPP;
 
 	/*
 	 * The Go server writes the whole 256-byte image in one syscall, and
@@ -2506,10 +2759,12 @@ static int lt6911_proc_init(struct lt6911 *lt)
 	for (i = 0; i < ARRAY_SIZE(lt6911_proc_files); i++) {
 		umode_t mode = lt6911_proc_files[i].mode;
 
-		if (lt->chip == LT6911_CHIP_C &&
-		    (!strcmp(lt6911_proc_files[i].name, "edid") ||
-		     !strcmp(lt6911_proc_files[i].name, "version")))
-			mode = 0444;
+		if (lt->chip == LT6911_CHIP_C) {
+			if (!strcmp(lt6911_proc_files[i].name, "version"))
+				mode = 0444;
+			if (!strcmp(lt6911_proc_files[i].name, "edid"))
+				mode = 0644;
+		}
 		if (!proc_create_data(lt6911_proc_files[i].name,
 				      mode,
 				      lt->proc_dir,
