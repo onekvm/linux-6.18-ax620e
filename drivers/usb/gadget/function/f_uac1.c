@@ -1657,8 +1657,9 @@ static ssize_t f_uac1_opts_##name##_store(struct config_item *item,	\
 		goto end;						\
 	}								\
 									\
-	ret = scnprintf(opts->name, min(sizeof(opts->name), len),	\
-			"%s", page);					\
+	scnprintf(opts->name, min(sizeof(opts->name), len + 1),	\
+		  "%s", page);					\
+	ret = len;						\
 									\
 end:									\
 	mutex_unlock(&opts->lock);					\
