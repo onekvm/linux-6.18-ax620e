@@ -276,6 +276,35 @@
 			#clock-cells = <1>;
 		};
 
+		dmaper: dma-controller@48a0000 {
+			compatible = "axera,ax620e-dmaper";
+			reg = <0x0 0x048a0000 0x0 0x400>;
+			interrupts = <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>;
+			#dma-cells = <1>;
+			axera,syscon = <&clk_periph>;
+			clocks = <&clk_periph AX620X_ACLK_AX_DMA_PER_EB>,
+				 <&clk_periph AX620X_PCLK_AX_DMA_PER_EB>;
+			resets = <&periph_reset_ext 1 0xd8 1 0xdc>,
+				 <&periph_reset_ext 2 0xd8 2 0xdc>;
+			status = "disabled";
+		};
+
+		hdmi_audio: audio-controller@6051000 {
+			compatible = "axera,ax630c-hdmi-audio";
+			reg = <0x0 0x06051000 0x0 0x400>;
+			interrupts = <GIC_SPI 145 IRQ_TYPE_LEVEL_HIGH>;
+			#sound-dai-cells = <0>;
+			axera,syscon = <&clk_periph>;
+			clocks = <&clk_periph AX620X_PCLK_I2S_S_EB>;
+			clock-names = "pclk";
+			resets = <&periph_reset_ext 8 0xe0 8 0xe4>,
+				 <&periph_reset_ext 9 0xe0 9 0xe4>;
+			reset-names = "bus", "core";
+			dmas = <&dmaper 17>;
+			dma-names = "rx";
+			status = "disabled";
+		};
+
 		wdt0: watchdog@4840000 {
 			compatible = "axera,ax620e-wdt";
 			reg = <0x0 0x04840000 0x0 0x400>;

@@ -23,6 +23,8 @@ menuconfig SND_SOC
 
 if SND_SOC
 
+source "sound/soc/axera/Kconfig"
+
 config SND_SOC_AC97_BUS
 	bool
 

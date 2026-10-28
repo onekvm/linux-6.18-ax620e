@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config SND_SOC_AX630C_HDMI
+	tristate "AX630C HDMI I2S capture"
+	depends on OF && (ARCH_AXERA || COMPILE_TEST)
+	depends on DMA_ENGINE
+	select SND_SOC_GENERIC_DMAENGINE_PCM
+	help
+	  Capture stereo PCM from the LT6911 HDMI bridge via the AX630C
+	  I2S slave (RX1) and peripheral DMA. Initial format: 48kHz S16_LE.

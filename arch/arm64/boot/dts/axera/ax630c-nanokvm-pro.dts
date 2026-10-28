@@ -427,3 +427,12 @@
 		drive-strength = <3>;
 	};
 };
+
+/* HDMI audio uses the bridge's external I2S clock, independently of USB. */
+&dmaper {
+	status = "okay";
+};
+
+&hdmi_audio {
+	status = "okay";
+};
