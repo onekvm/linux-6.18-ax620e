@@ -221,6 +221,7 @@ struct lt6911 {
 	struct device *dev;
 	enum lt6911_chip chip;
 	bool powered;
+	bool shadow_supported;
 	bool shadow_override;
 	bool shadow_restore_pending;
 	u8 shadow_desired[LT6911_EDID_SIZE];
@@ -676,8 +677,14 @@ static int lt6911_set_power(struct lt6911 *lt, bool on)
 	lt6911_set_text(&lt->power, on ? "on\n" : "off\n");
 	mutex_unlock(&lt->buf_lock);
 
-	if (on && lt->shadow_override && (!was_powered || lt->shadow_restore_pending)) {
+	/* Every caller may access I2C immediately afterwards, including EDID
+	 * reads and writes that wake an idle bridge without using /proc/power.
+	 * Hold chip_lock through the same settling interval as that interface.
+	 */
+	if (on && (!was_powered || lt->shadow_restore_pending))
 		msleep(300);
+
+	if (on && lt->shadow_override && (!was_powered || lt->shadow_restore_pending)) {
 		ret = lt6911uxc_shadow_apply(lt, lt->shadow_desired, actual);
 		lt->shadow_restore_pending = ret != 0;
 		mutex_lock(&lt->buf_lock);
@@ -1242,6 +1249,24 @@ out:
 	return cleanup ? -EUCLEAN : ret;
 }
 
+/* Caller holds chip_lock; retain the Flash snapshot if RAM is unavailable. */
+static int lt6911uxc_seed_snapshot(struct lt6911 *lt)
+{
+	u8 actual[LT6911_EDID_SIZE];
+	int ret;
+
+	lt->shadow_supported = false;
+	ret = lt6911uxc_shadow_apply(lt, NULL, actual);
+	if (ret)
+		return ret;
+	mutex_lock(&lt->buf_lock);
+	memcpy(lt->edid_snapshot, actual, sizeof(actual));
+	lt->edid_snapshot_len = sizeof(actual);
+	mutex_unlock(&lt->buf_lock);
+	lt->shadow_supported = true;
+	return 0;
+}
+
 static int lt6911c_flash_end(struct lt6911 *lt)
 {
 	int ret, disable_ret;
@@ -1489,7 +1514,8 @@ out:
 /*
  * D has a different flash controller, including command delays and an E1
  * FIFO reset. Keep it separate: substituting E0 into the UXC sequences is
- * not equivalent. These sequences follow Sipeed SDK v0.0.32 verbatim.
+ * not equivalent. The command sequences follow Sipeed SDK v0.0.32;
+ * cleanup additionally closes E0:EE to release the MCU register window.
  */
 struct lt6911d_step {
 	u8 reg;
@@ -1528,9 +1554,24 @@ static int lt6911d_flash_end(struct lt6911 *lt)
 {
 	static const struct lt6911d_step seq[] = {
 		{ 0x5a, 0x08, 1 }, { 0x5a, 0x00, 0 }, { 0x58, 0x00, 0 },
+		{ 0xee, 0x00, 0 },
 	};
+	size_t i;
+	int ret, first_err = 0;
 
-	return lt6911d_seq(lt, seq, ARRAY_SIZE(seq));
+	/* An earlier cleanup failure must not skip the MCU window close. */
+	for (i = 0; i < ARRAY_SIZE(seq); i++) {
+		ret = lt6911_write(lt, LT6911D_BANK_MANAGE, seq[i].reg, seq[i].val);
+		if (ret) {
+			dev_err(lt->dev, "D flash cleanup E0:%02x failed: %d\n",
+				seq[i].reg, ret);
+			if (!first_err)
+				first_err = ret;
+		}
+		if (seq[i].delay_ms)
+			msleep(seq[i].delay_ms);
+	}
+	return first_err;
 }
 
 static int lt6911d_flash_reset_fifo(struct lt6911 *lt)
@@ -2400,8 +2441,6 @@ static ssize_t lt6911_power_write(struct file *file, const char __user *ubuf,
 	 */
 	mutex_lock(&lt->chip_lock);
 	ret = lt6911_set_power(lt, on);
-	if (!ret && on)
-		msleep(300);
 	mutex_unlock(&lt->chip_lock);
 	if (ret)
 		return -EIO;
@@ -2704,6 +2743,15 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 	s64 age;
 	int ret;
 
+	if (*ppos < 0)
+		return -EINVAL;
+	/* A caller such as cat reads again to discover EOF. D's refresh can
+	 * exceed the 500 ms cache interval, so checking EOF only after I2C
+	 * would reset the bridge again immediately after its previous reset.
+	 */
+	if (!count || *ppos >= LT6911_EDID_SIZE)
+		return 0;
+
 	mutex_lock(&lt->chip_lock);
 
 	age = ktime_to_ms(ktime_sub(now, lt->edid_read_ts));
@@ -2727,9 +2775,9 @@ static ssize_t lt6911_edid_proc_read(struct file *file, char __user *ubuf,
 		ret = lt6911_power_cycle(lt);
 		if (ret)
 			goto out;
+		/* The cache lifetime begins after the slow Flash read and reset. */
+		lt->edid_read_ts = ktime_get();
 	}
-
-	lt->edid_read_ts = now;
 
 	mutex_lock(&lt->buf_lock);
 	len = lt->edid_len;
@@ -3054,7 +3102,7 @@ static int lt6911_proc_init(struct lt6911 *lt)
 	for (i = 0; i < ARRAY_SIZE(lt6911_proc_files); i++) {
 		umode_t mode = lt6911_proc_files[i].mode;
 
-		if (lt->chip != LT6911_CHIP_UXC &&
+		if (!lt->shadow_supported &&
 		    !strcmp(lt6911_proc_files[i].name, "edid_shadow"))
 			continue;
 
@@ -3227,7 +3275,6 @@ static int lt6911_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct lt6911 *lt;
-	u8 shadow[LT6911_EDID_SIZE];
 	int ret;
 
 	if (!i2c_check_functionality(client->adapter,
@@ -3331,20 +3378,12 @@ static int lt6911_probe(struct i2c_client *client)
 		lt->version[0] = '\0';
 	}
 
-	if (lt->chip != LT6911_CHIP_UXC) {
-		ret = lt6911_edid_read(lt, lt->edid_snapshot);
-		if (ret)
-			dev_warn(dev, "cannot read EDID: %d\n", ret);
-		else
-			lt->edid_snapshot_len = LT6911_EDID_SIZE;
-	}
+	ret = lt6911_edid_read(lt, lt->edid_snapshot);
+	if (ret)
+		dev_warn(dev, "cannot read EDID: %d\n", ret);
+	else
+		lt->edid_snapshot_len = LT6911_EDID_SIZE;
 	mutex_unlock(&lt->chip_lock);
-
-	ret = lt6911_proc_init(lt);
-	if (ret) {
-		dev_err(dev, "cannot create /proc/lt6911_info\n");
-		goto err_irq;
-	}
 
 	/*
 	 * Power-cycle both rails to finish. This is not tidying: it is what
@@ -3358,20 +3397,18 @@ static int lt6911_probe(struct i2c_client *client)
 	 */
 	ret = lt6911_set_hdmi_power(lt, false);
 	if (ret)
-		goto err_proc;
+		goto err_irq;
 	ret = lt6911_set_power(lt, false);
 	if (ret)
-		goto err_proc;
+		goto err_irq;
 	msleep(100);
 	ret = lt6911_set_power(lt, true);
 	if (ret)
-		goto err_proc;
+		goto err_irq;
 	msleep(100);
 	ret = lt6911_set_hdmi_power(lt, true);
 	if (ret)
-		goto err_proc;
-
-	dev_info(dev, "ready\n");
+		goto err_irq;
 
 	/*
 	 * The power cycle above is what edges the interrupt for a source
@@ -3379,12 +3416,23 @@ static int lt6911_probe(struct i2c_client *client)
 	 * still fills /proc/lt6911_info instead of leaving 0x0 forever.
 	 */
 	msleep(300);
+	if (lt->chip == LT6911_CHIP_UXC) {
+		mutex_lock(&lt->chip_lock);
+		ret = lt6911uxc_seed_snapshot(lt);
+		mutex_unlock(&lt->chip_lock);
+		if (ret)
+			dev_warn(dev, "temporary EDID unavailable: %d\n", ret);
+	}
+	ret = lt6911_proc_init(lt);
+	if (ret) {
+		dev_err(dev, "cannot create /proc/lt6911_info\n");
+		goto err_irq;
+	}
+	dev_info(dev, "ready\n");
 	schedule_work(&lt->info_work);
 
 	return 0;
 
-err_proc:
-	lt6911_proc_exit(lt);
 err_irq:
 	lt6911_free_irqs(lt);
 	cancel_work_sync(&lt->info_work);
