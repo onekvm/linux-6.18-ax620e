@@ -241,6 +241,8 @@ static const struct i2c_device_id cst816x_id[] = {
 MODULE_DEVICE_TABLE(i2c, cst816x_id);
 
 static const struct of_device_id cst816x_of_match[] = {
+	/* Factory NanoKVM Go names the CST8xx wire protocol, not a chip SKU. */
+	{ .compatible = "hyn,8xxt", },
 	{ .compatible = "hynitron,cst816d", },
 	{ .compatible = "hynitron,cst816s", },
 	{ }

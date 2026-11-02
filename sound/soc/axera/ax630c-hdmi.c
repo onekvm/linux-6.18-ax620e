@@ -243,9 +243,14 @@ static int ax_probe(struct platform_device *pdev)
 	syscon = syscon_regmap_lookup_by_phandle(dev->of_node, "axera,syscon");
 	if (IS_ERR(syscon))
 		return PTR_ERR(syscon);
+	u32 route = (3 << 9) | BIT(5);
+
+	device_property_read_u32(dev, "axera,slave-routing", &route);
+	if (route & ~GENMASK(10, 5))
+		return -EINVAL;
 	/* Modify only the slave/external-codec route, preserve master/TDM. */
 	ret = regmap_update_bits(syscon, 0x3c,
-		BIT(19) | BIT(17) | GENMASK(10, 5), BIT(19) | (3 << 9) | BIT(5));
+		BIT(19) | BIT(17) | GENMASK(10, 5), BIT(19) | route);
 	if (ret)
 		return ret;
 	ax_stop(hdmi);

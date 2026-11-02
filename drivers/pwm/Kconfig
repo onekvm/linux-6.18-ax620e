@@ -820,3 +820,10 @@ config PWM_XILINX
 	  will be called pwm-xilinx.
 
 endif
+
+config PWM_AXERA
+	tristate "Axera AX620E PWM"
+	depends on PWM && OF && COMMON_CLK && RESET_CONTROLLER
+	depends on ARCH_AXERA || COMPILE_TEST
+	help
+	  Four-channel timer PWM for AX620E/AX620Q boards.

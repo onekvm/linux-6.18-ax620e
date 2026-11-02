@@ -677,3 +677,11 @@ source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
 endmenu
+
+config LT7911
+    tristate "Lontium LT7911D / LT7911EXC bridge management"
+    depends on I2C && OF && GPIOLIB && PROC_FS
+    select REGMAP_I2C
+    help
+      Signal, audio and EDID management for NanoKVM Go DP-to-CSI bridges.
+      Firmware writes are explicit and never performed during probe.

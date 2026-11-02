@@ -204,6 +204,13 @@ static int axera_wdt_probe(struct platform_device *pdev)
 		axera_wdt_ping(wdd);
 	}
 	watchdog_init_timeout(wdd, 0, dev);
+	if (!watchdog_hw_running(wdd) &&
+	    device_property_read_bool(dev, "axera,boot-watchdog")) {
+		ret = axera_wdt_start(wdd);
+		if (ret)
+			return ret;
+		set_bit(WDOG_HW_RUNNING, &wdd->status);
+	}
 	if (watchdog_hw_running(wdd)) {
 		ret = axera_wdt_set_timeout(wdd, wdd->timeout);
 		if (ret)

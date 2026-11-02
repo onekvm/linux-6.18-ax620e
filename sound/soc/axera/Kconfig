@@ -7,3 +7,8 @@ config SND_SOC_AX630C_HDMI
 	help
 	  Capture stereo PCM from the LT6911 HDMI bridge via the AX630C
 	  I2S slave (RX1) and peripheral DMA. Initial format: 48kHz S16_LE.
+
+config SND_SOC_AX620E_CODEC
+	tristate "AX620E internal playback codec"
+	depends on OF && ARCH_AXERA
+	select REGMAP_MMIO

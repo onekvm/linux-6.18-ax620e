@@ -177,3 +177,9 @@ config FB_TFT_UPD161704
 	  Generic Framebuffer support for uPD161704
 
 endif
+
+config FB_TFT_ST7789P3
+    tristate "FB driver for the ST7789P3 LCD Controller"
+    depends on FB_TFT
+    help
+      RGB565 framebuffer for the NanoKVM Go 240 x 284 SPI panel.

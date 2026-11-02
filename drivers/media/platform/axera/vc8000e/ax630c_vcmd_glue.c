@@ -284,6 +284,7 @@ static void ax630c_vcmd_remove(struct platform_device *pdev)
 
 static const struct of_device_id ax630c_vcmd_of_match[] = {
 	{ .compatible = "axera,ax630c-vc8000e" },
+	{ .compatible = "axera,ax620q-vc8000e" },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, ax630c_vcmd_of_match);

@@ -938,6 +938,20 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		return PTR_ERR(dev->i2s_base);
 
 	dev->dev = &pdev->dev;
+	if (of_device_is_compatible(pdev->dev.of_node, "axera,ax620e-i2s")) {
+		struct regmap *syscon;
+		struct clk *apb = devm_clk_get_enabled(&pdev->dev, "apb");
+
+		if (IS_ERR(apb))
+			return dev_err_probe(&pdev->dev, PTR_ERR(apb), "I2S APB clock\n");
+		syscon = syscon_regmap_lookup_by_phandle(pdev->dev.of_node, "axera,syscon");
+		if (IS_ERR(syscon))
+			return PTR_ERR(syscon);
+		/* Internal DAC and external DP capture share PAD0 routing. */
+		ret = regmap_update_bits(syscon, 0x3c, BIT(20), BIT(20));
+		if (ret)
+			return ret;
+	}
 	dev->is_jh7110 = false;
 	if (pdata) {
 		if (pdata->i2s_pd_init) {

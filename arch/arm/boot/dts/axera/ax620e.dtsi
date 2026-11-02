@@ -1,91 +1,62 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/*
- * Axera AX620E SoC (AArch32)
- */
-
-#include <dt-bindings/clock/ax620e-clock.h>
-#include <dt-bindings/interrupt-controller/arm-gic.h>
+/* AX620Q boots in AArch32 with the vendor holding-pen SMP protocol. */
+#include "ax620e-common.dtsi"
 
 / {
-	compatible = "axera,ax620e";
-	interrupt-parent = <&gic>;
-	#address-cells = <1>;
-	#size-cells = <1>;
-
 	cpus {
+		secondary-boot-reg = <0x023400dc>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 
 		cpu0: cpu@0 {
 			device_type = "cpu";
-			compatible = "arm,cortex-a7";
+			compatible = "arm,cortex-a53";
 			reg = <0x0>;
 			enable-method = "axera,ax620e-smp";
 			clocks = <&clk_cpu AX620X_CLK_CPU_SEL>;
+			operating-points-v2 = <&cpu_opp_table>;
 		};
 
 		cpu1: cpu@1 {
 			device_type = "cpu";
-			compatible = "arm,cortex-a7";
+			compatible = "arm,cortex-a53";
 			reg = <0x1>;
 			enable-method = "axera,ax620e-smp";
 			clocks = <&clk_cpu AX620X_CLK_CPU_SEL>;
+			operating-points-v2 = <&cpu_opp_table>;
 		};
 	};
 
-	timer {
-		compatible = "arm,armv7-timer";
-		arm,cpu-registers-not-fw-configured;
-		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_LEVEL_LOW)>,
-			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_LEVEL_LOW)>,
-			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_LEVEL_LOW)>,
-			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_LEVEL_LOW)>;
-		clock-frequency = <24000000>;
-	};
+    timer {
+        compatible = "arm,armv7-timer";
+    };
 
-	soc {
-		compatible = "simple-bus";
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges;
+    soc {
+        uart3: serial@6080000 {
+            compatible = "snps,dw-apb-uart";
+            reg = <0 0x06080000 0 0x400>;
+            interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>;
+            clock-frequency = <208000000>;
+            reg-shift = <2>;
+            reg-io-width = <4>;
+            status = "disabled";
+        };
 
-		gic: interrupt-controller@1851000 {
-			compatible = "arm,gic-400";
-			reg = <0x01851000 0x1000>,
-			      <0x01852000 0x2000>,
-			      <0x01854000 0x2000>,
-			      <0x01856000 0x2000>;
-			interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(2) | IRQ_TYPE_LEVEL_LOW)>;
-			interrupt-controller;
-			#interrupt-cells = <3>;
-		};
-
-		clk_cpu: clock-controller@1900000 {
-			compatible = "axera,ax620x-cpu-clk";
-			reg = <0x01900000 0x1000>;
-			#clock-cells = <1>;
-		};
-
-		clk_pllc: clock-controller@2210000 {
-			compatible = "axera,ax620x-pllc-clk";
-			reg = <0x02210000 0x1000>;
-			#clock-cells = <1>;
-		};
-
-		clk_common: clock-controller@2340000 {
-			compatible = "axera,ax620x-common-clk";
-			reg = <0x02340000 0x1000>;
-			#clock-cells = <1>;
-		};
-
-		uart0: serial@4880000 {
-			compatible = "snps,dw-apb-uart";
-			reg = <0x04880000 0x400>;
-			interrupts = <GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>;
-			clock-frequency = <208000000>;
-			reg-shift = <2>;
-			reg-io-width = <4>;
-			status = "disabled";
-		};
-	};
+        i2c1: i2c@4851000 {
+            compatible = "snps,designware-i2c";
+            reg = <0 0x04851000 0 0x400>;
+            interrupts = <GIC_SPI 136 IRQ_TYPE_LEVEL_HIGH>;
+            clocks = <&clk_periph AX620X_CLK_I2C_MST1_EB>,
+                     <&clk_periph AX620X_PCLK_I2C_MST1_EB>;
+            clock-names = "ref", "pclk";
+            resets = <&periph_reset_ext 20 0xd8 20 0xdc>,
+                     <&periph_reset_ext 21 0xd8 21 0xdc>;
+            reset-names = "prst", "rst";
+            clock-frequency = <400000>;
+            i2c-sda-hold-time-ns = <500>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "disabled";
+        };
+    };
 };

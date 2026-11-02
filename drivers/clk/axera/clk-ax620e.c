@@ -510,6 +510,13 @@ static struct axera_mux_clock ax620x_mux_clks_periph[] __initdata = {
 };
 
 static struct axera_gate_clock ax620x_gate_clks_periph[] __initdata = {
+	{AX620X_CLK_I2C_MST1_EB, "clk_i2c_mst1_eb", "clk_i2c_eb", CLK_SET_RATE_PARENT, 0x8, 9, 1, 0, 0, 0, 0,},
+	{AX620X_PCLK_I2C_MST1_EB, "pclk_i2c_mst1_eb", "pclk_top_sel", CLK_SET_RATE_PARENT, 0xC, 18, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_PWM10_EB, "clk_pwm10_eb", "clk_timer_eb", 0, 0x8, 23, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_PWM11_EB, "clk_pwm11_eb", "clk_timer_eb", 0, 0x8, 24, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_PWM12_EB, "clk_pwm12_eb", "clk_timer_eb", 0, 0x8, 25, 1, 0, 0, 0, 0,},
+	{AX620X_CLK_PWM13_EB, "clk_pwm13_eb", "clk_timer_eb", 0, 0x8, 26, 1, 0, 0, 0, 0,},
+	{AX620X_PCLK_PWM1_EB, "pclk_pwm1_eb", "pclk_top_sel", 0, 0x10, 0, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_WDT0_EB, "clk_wdt0_eb", "clk_wdt0_sel", 0, 0x4, 14, 1, 0, 0, 0, 0,},
 	{AX620X_PCLK_WDT0_EB, "pclk_wdt0_eb", "pclk_top_sel", 0, 0x10, 19, 1, 0, 0, 0, 0,},
 	{AX620X_CLK_CE_CNT_EB, "clk_ce_cnt_eb", "cpll_24m", 0, 0x4, 0, 1, 0, 0, 0, 0,},

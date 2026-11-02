@@ -24,6 +24,9 @@ allOf:
 properties:
   compatible:
     const: axera,ax620e-wdt
+  axera,boot-watchdog:
+    type: boolean
+    description: Arm at probe, with the kernel boot-open timeout until userspace takes ownership.
   reg:
     maxItems: 1
   clocks:
