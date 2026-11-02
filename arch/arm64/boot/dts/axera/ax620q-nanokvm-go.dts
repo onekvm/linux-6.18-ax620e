@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/dts-v1/;
+#include "ax620e.dtsi"
+#include "../../../../arm/boot/dts/axera/ax620q-peripherals.dtsi"
+#include "../../../../arm/boot/dts/axera/ax620q-nanokvm-go-common.dtsi"
+
+/ {
+	reserved-memory {
+		/* BL31 stays resident for PSCI after U-Boot has exited. */
+		atf_reserved: atf@40040000 {
+			reg = <0 0x40040000 0 0x40000>;
+			no-map;
+		};
+	};
+};

@@ -31,32 +31,6 @@
         compatible = "arm,armv7-timer";
     };
 
-    soc {
-        uart3: serial@6080000 {
-            compatible = "snps,dw-apb-uart";
-            reg = <0 0x06080000 0 0x400>;
-            interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>;
-            clock-frequency = <208000000>;
-            reg-shift = <2>;
-            reg-io-width = <4>;
-            status = "disabled";
-        };
-
-        i2c1: i2c@4851000 {
-            compatible = "snps,designware-i2c";
-            reg = <0 0x04851000 0 0x400>;
-            interrupts = <GIC_SPI 136 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&clk_periph AX620X_CLK_I2C_MST1_EB>,
-                     <&clk_periph AX620X_PCLK_I2C_MST1_EB>;
-            clock-names = "ref", "pclk";
-            resets = <&periph_reset_ext 20 0xd8 20 0xdc>,
-                     <&periph_reset_ext 21 0xd8 21 0xdc>;
-            reset-names = "prst", "rst";
-            clock-frequency = <400000>;
-            i2c-sda-hold-time-ns = <500>;
-            #address-cells = <1>;
-            #size-cells = <0>;
-            status = "disabled";
-        };
-    };
 };
+
+#include "ax620q-peripherals.dtsi"

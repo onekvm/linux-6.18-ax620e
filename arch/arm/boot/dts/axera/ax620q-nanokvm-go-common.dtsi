@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* Go board resources shared by AArch32 and AArch64. */
+
+/ {
+	model = "Sipeed NanoKVM Go (AX620Q)";
+	compatible = "sipeed,nanokvm-go", "axera,ax620q", "axera,ax620e";
+
+	aliases {
+		serial0 = &uart0;
+		serial3 = &uart3;
+		mmc0 = &emmc;
+		mmc1 = &sd;
+		mmc2 = &sdio;
+		i2c1 = &i2c1;
+	};
+
+	chosen {
+		stdout-path = "serial3:115200n8";
+		bootargs = "console=ttyS3,115200n8 earlycon=uart8250,mmio32,0x06080000";
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0 0x10000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		ddr_retrain: ddr-retrain@40000000 {
+			reg = <0 0x40000000 0 0x1000>;
+			no-map;
+		};
+		crash_reserved: crash@45ffd000 {
+			reg = <0 0x45ffd000 0 0x3000>;
+			no-map;
+		};
+		/* Keep the factory 128 MiB Linux / 128 MiB media boundary. */
+		capture_pool: capture-pool@48000000 {
+			compatible = "shared-dma-pool";
+			reg = <0 0x48000000 0 0x02000000>;
+			no-map;
+		};
+		venc_framebuf: venc-framebuf@4a000000 {
+			reg = <0 0x4a000000 0 0x05800000>;
+			no-map;
+		};
+		venc_cmdbuf: venc-cmdbuf@4f800000 {
+			compatible = "shared-dma-pool";
+			reg = <0 0x4f800000 0 0x00800000>;
+			no-map;
+		};
+	};
+
+	reboot {
+		compatible = "syscon-reboot";
+		regmap = <&common_reset>;
+		offset = <0xa8>;
+		mask = <1>;
+		value = <1>;
+		priority = <192>;
+	};
+
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&go_wifi_reset>;
+		reset-gpios = <&gpio1 28 GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <200>;
+		power-off-delay-us = <10000>;
+	};
+
+
+	panel_backlight: panel-backlight {
+		compatible = "pwm-backlight";
+		pwms = <&go_pwm1 2 462963 0>;
+		brightness-levels = <0 255>;
+		num-interpolated-steps = <255>;
+		default-brightness-level = <125>;
+	};
+};
+
+&uart0 { status = "okay"; };
+&uart3 { status = "okay"; };
+&wdt0 { status = "okay"; timeout-sec = <60>; axera,boot-watchdog; };
+&eth0 { status = "disabled"; };
+&emmc { status = "disabled"; };
+
+&sd {
+	status = "okay";
+	bus-width = <4>;
+	max-frequency = <33333333>;
+	cap-sd-highspeed;
+	no-sdio;
+	no-mmc;
+	disable-wp;
+	broken-cd;
+	sdhci-caps-mask = <0x7 0x00200000>;
+	cdns,phy-input-delay-sd-highspeed = <2>;
+	cdns,phy-input-delay-legacy = <3>;
+	cdns,phy-input-delay-sd-uhs-sdr12 = <3>;
+	cdns,phy-input-delay-sd-uhs-sdr25 = <2>;
+	cdns,phy-dll-delay-sdclk = <0>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sd_clk_pins &sd_cmd_pins &sd_dat0_pins
+				 &sd_dat1_pins &sd_dat2_pins &sd_dat3_pins
+				 &sd_power_pins &sd_voltage_pins>;
+};
+
+&sdio {
+	status = "okay";
+	bus-width = <4>;
+	max-frequency = <50000000>;
+	cap-sd-highspeed;
+	no-1-8-v;
+	no-sd;
+	no-mmc;
+	non-removable;
+	mmc-pwrseq = <&wifi_pwrseq>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdio_clk_pins &sdio_cmd_pins &sdio_dat0_pins
+				 &sdio_dat1_pins &sdio_dat2_pins &sdio_dat3_pins>;
+};
+
+&usb { status = "okay"; };
+&usb2 {
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <400000>;
+	lt7911: displayport-receiver@41 {
+		compatible = "lontium,lt7911exc";
+		reg = <0x41>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&go_bridge_irq &go_bridge_reset>;
+		irq-gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio1 1 GPIO_ACTIVE_HIGH>;
+	};
+	accelerometer@19 {
+		compatible = "silan,sc7a20";
+		reg = <0x19>;
+		mount-matrix = "1", "0", "0", "0", "1", "0", "0", "0", "1";
+	};
+};
+
+&i2c1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&go_i2c1_scl &go_i2c1_sda>;
+	touchscreen@15 {
+		compatible = "hyn,8xxt";
+		reg = <0x15>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&go_touch_irq &go_touch_reset>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <2 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+		touchscreen-size-x = <240>;
+		touchscreen-size-y = <296>;
+		touchscreen-inverted-y;
+	};
+};
+
+&spi2 {
+	status = "okay";
+	cs-gpios = <&gpio1 27 GPIO_ACTIVE_LOW>;
+	pinctrl-0 = <&go_spi_clk &go_spi_mosi &go_spi_cs
+				 &go_panel_dc &go_panel_reset>;
+	panel@0 {
+		compatible = "sitronix,st7789p3";
+		reg = <0>;
+		spi-max-frequency = <80000000>;
+		buswidth = <8>;
+		rotate = <0>;
+		fps = <30>;
+		dc-gpios = <&gpio1 19 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio0 31 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&mipi_rx { status = "okay"; };
+&vin {
+	status = "okay";
+	memory-region = <&capture_pool>;
+};
+&venc {
+	compatible = "axera,ax620q-vc8000e";
+	status = "okay";
+	memory-region = <&venc_cmdbuf>, <&venc_framebuf>;
+	memory-region-names = "cmdbuf", "framebuf";
+	assigned-clocks = <&clk_vpu AX620X_CLK_VPU_GLB_SEL>;
+	assigned-clock-parents = <&clk_common AX620X_CPLL_312M>;
+};
+&tdp { status = "okay"; };
+&vdec { status = "okay"; };
+&jenc { status = "okay"; };
+&dmaper { status = "okay"; };
+&hdmi_audio { status = "okay"; axera,slave-routing = <0x320>; };
+&crypto { status = "okay"; };
+
+&pinctrl {
+	go_wifi_reset: go-wifi-reset { pins = "EPHY_LED0"; function = "GPIO1_A28"; };
+	go_bridge_irq: go-bridge-irq { pins = "UART2_TXD"; function = "GPIO1_A0"; bias-pull-up; };
+	go_bridge_reset: go-bridge-reset { pins = "UART2_RXD"; function = "GPIO1_A1"; };
+	go_i2c1_scl: go-i2c1-scl { pins = "I2C1_SCL"; function = "I2C1_SCL"; };
+	go_i2c1_sda: go-i2c1-sda { pins = "I2C1_SDA"; function = "I2C1_SDA"; };
+	go_touch_irq: go-touch-irq { pins = "VI_D2"; function = "GPIO0_A2"; bias-pull-up; };
+	go_touch_reset: go-touch-reset { pins = "VI_D4"; function = "GPIO0_A4"; };
+	go_spi_clk: go-spi-clk { pins = "RGMII_TXCLK"; function = "SPI_M2_SCLK_M"; drive-strength = <3>; };
+	go_spi_mosi: go-spi-mosi { pins = "RGMII_TXD0"; function = "SPI_M2_MOSI_M"; drive-strength = <3>; };
+	go_spi_cs: go-spi-cs { pins = "EPHY_RSTN"; function = "GPIO1_A27"; };
+	go_panel_dc: go-panel-dc { pins = "RGMII_TXD1"; function = "GPIO1_A19"; };
+	go_panel_reset: go-panel-reset { pins = "UART1_RXD"; function = "GPIO0_A31"; };
+	go_backlight_pin: go-backlight-pin { pins = "UART1_TXD"; function = "PWM06"; };
+};
+
+&{/soc} {
+	go_pwm1: pwm@6061000 {
+		compatible = "axera,ax620e-pwm";
+		reg = <0 0x06061000 0 0x400>;
+		#pwm-cells = <3>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&go_backlight_pin>;
+		clocks = <&clk_periph AX620X_PCLK_PWM1_EB>,
+			 <&clk_periph AX620X_CLK_PWM10_EB>,
+			 <&clk_periph AX620X_CLK_PWM11_EB>,
+			 <&clk_periph AX620X_CLK_PWM12_EB>,
+			 <&clk_periph AX620X_CLK_PWM13_EB>;
+		clock-names = "pclk", "ch0", "ch1", "ch2", "ch3";
+		assigned-clocks = <&clk_periph AX620X_CLK_TIMER_SEL>;
+		assigned-clock-parents = <&clk_common AX620X_CPLL_24M>;
+		resets = <&periph_reset_ext 24 0xe0 24 0xe4>,
+			 <&periph_reset_ext 20 0xe0 20 0xe4>,
+			 <&periph_reset_ext 21 0xe0 21 0xe4>,
+			 <&periph_reset_ext 22 0xe0 22 0xe4>,
+			 <&periph_reset_ext 23 0xe0 23 0xe4>;
+	};
+};
+
+/ {
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "OneKVM Speaker";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,playback-only;
+		simple-audio-card,cpu { sound-dai = <&go_i2s_master>; };
+		simple-audio-card,codec {
+			sound-dai = <&go_codec>;
+			system-clock-frequency = <12288000>;
+		};
+	};
+};
+
+&{/soc} {
+	go_common_reset: reset-controller-ext@2340000 {
+		compatible = "axera,axera_reset_match", "syscon";
+		reg = <0 0x02340000 0 0x10000>;
+		#reset-cells = <4>;
+	};
+	go_codec: audio-codec@23f2000 {
+		compatible = "axera,ax620e-codec";
+		reg = <0 0x023f2000 0 0x1000>;
+		#sound-dai-cells = <0>;
+		clocks = <&clk_common AX620X_CLK_AUDIO_TLB_EB>,
+			 <&clk_periph AX620X_CLK_I2S_AUDIO_REF_EB>;
+		clock-names = "bus", "mclk";
+		resets = <&go_common_reset 0 0x58 0 0x5c>,
+			 <&periph_reset_ext 0 0xd8 0 0xdc>;
+	};
+	go_i2s_master: audio-controller@6050000 {
+		compatible = "axera,ax620e-i2s", "snps,designware-i2s";
+		reg = <0 0x06050000 0 0x400>;
+		interrupts = <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
+		#sound-dai-cells = <0>;
+		axera,syscon = <&clk_periph>;
+		clocks = <&clk_periph AX620X_SCLK_I2S_M_EB>,
+			 <&clk_periph AX620X_PCLK_I2S_M_EB>;
+		clock-names = "i2sclk", "apb";
+		assigned-clocks = <&clk_periph AX620X_SCLK_I2S_M_SEL>;
+		assigned-clock-parents = <&clk_common AX620X_HPLL_24P576M>;
+		resets = <&periph_reset_ext 6 0xe0 6 0xe4>,
+			 <&periph_reset_ext 7 0xe0 7 0xe4>;
+	};
+};
