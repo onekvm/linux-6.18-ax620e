@@ -1059,7 +1059,7 @@ static int lt6911_get_fps(struct lt6911 *lt, u16 *fps)
 
 static int lt6911_check_edid(struct lt6911 *lt, const u8 *edid, size_t len);
 
-/* UXC Shadow profile observed on 107. Pro firmware acceptance is pending.
+/* UXC Shadow profile verified on PCIe and Pro.
  * Caller stops VIN before entering and holds chip_lock throughout. Only
  * volatile registers are used; C/D must never reach this path.
  */
@@ -1159,14 +1159,28 @@ static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actu
 	if (ret)
 		goto out;
 	msleep(200);
+	/* Pro returns a constant (observed 0x60) through B0B0 with bit 2 set.
+	 * Select RAM access for reads as well as writes.
+	 * Keep HPD low until the original control and index are restored.
+	 */
+	ret = lt6911_write(lt, 0xb0, 0x0b, control & ~BIT(2));
+	if (ret)
+		goto out;
 	ret = lt6911uxc_shadow_payload(lt, before, false);
 	if (ret)
 		goto out;
 	ret = lt6911uxc_shadow_payload(lt, verify, false);
 	if (ret)
 		goto out;
-	if (memcmp(before, verify, sizeof(before)) || before[126] != 1 ||
+	if (memcmp(before, verify, sizeof(before))) {
+		dev_err(lt->dev, "UXC Shadow EDID baseline reads differ\n");
+		ret = -EIO;
+		goto out;
+	}
+	if (before[126] != 1 ||
 	    lt6911_check_edid(lt, before, sizeof(before))) {
+		dev_err(lt->dev, "UXC Shadow EDID baseline invalid (header %8ph, extensions %u)\n",
+			before, before[126]);
 		ret = -EIO;
 		goto out;
 	}
@@ -1174,9 +1188,6 @@ static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actu
 		memcpy(actual, before, sizeof(before));
 		goto out;
 	}
-	ret = lt6911_write(lt, 0xb0, 0x0b, control & ~BIT(2));
-	if (ret)
-		goto out;
 	dirty = true;
 	/* The payload helper is shared with rollback, whose buffer is mutable. */
 	memcpy(verify, desired, sizeof(verify));
@@ -1187,6 +1198,7 @@ static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actu
 	if (ret)
 		goto out;
 	if (memcmp(verify, desired, sizeof(verify))) {
+		dev_err(lt->dev, "UXC Shadow EDID write verification failed\n");
 		ret = -EIO;
 		goto out;
 	}
@@ -1200,10 +1212,14 @@ static int lt6911uxc_shadow_apply(struct lt6911 *lt, const u8 *desired, u8 *actu
 	ret = lt6911_enable(lt);
 	if (ret)
 		goto out;
+	ret = lt6911_write(lt, 0xb0, 0x0b, control & ~BIT(2));
+	if (ret)
+		goto out;
 	ret = lt6911uxc_shadow_payload(lt, verify, false);
 	if (ret)
 		goto out;
 	if (memcmp(verify, desired, sizeof(verify))) {
+		dev_err(lt->dev, "UXC Shadow EDID MCU verification failed\n");
 		ret = -EIO;
 		goto out;
 	}
@@ -1219,6 +1235,7 @@ out:
 						watchdog_saved, state_saved);
 		if (!cleanup)
 			return 0;
+		dev_err(lt->dev, "UXC Shadow EDID state restore failed: %d\n", cleanup);
 		ret = cleanup;
 	}
 	if (dirty) {
