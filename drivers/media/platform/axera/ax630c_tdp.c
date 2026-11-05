@@ -5,6 +5,8 @@
  * from Axera's GPL ax_tdp module.
  */
 #include <linux/clk.h>
+#include <dt-bindings/clock/ax620e-clock.h>
+#include <linux/of.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
@@ -32,6 +34,10 @@
 #define TDP_AXI_BUSY 0x2f4
 #define TDP_DONE BIT(0)
 #define TDP_ERRORS (BIT(2) | BIT(3))
+
+static unsigned long mm_rate = 500000000;
+module_param(mm_rate, ulong, 0444);
+MODULE_PARM_DESC(mm_rate, "MM global clock in Hz feeding the TDP datapath (0 keeps the boot default)");
 
 struct tdp_dev {
 	struct device *dev;
@@ -161,6 +167,9 @@ static void tdp_program(struct tdp_ctx *ctx, dma_addr_t input, dma_addr_t output
 	u32 dst_width = d->width, dst_height = d->height;
 	dma_addr_t chroma = input + (u64)src_stride * s->height;
 	bool nv12 = s->pixelformat == V4L2_PIX_FMT_NV12;
+	/* Scale-only YUYV output: the vendor driver disables CSC (0x250 = 0) and
+	 * programs the writer with the same format code as the reader (0x13). */
+	bool yuv_out = d->pixelformat == V4L2_PIX_FMT_YUYV;
 	bool limited = s->quantization != V4L2_QUANTIZATION_FULL_RANGE;
 	bool bt709 = s->ycbcr_enc == V4L2_YCBCR_ENC_709;
 	int cy = limited ? 298 : 256;
@@ -207,7 +216,7 @@ static void tdp_program(struct tdp_ctx *ctx, dma_addr_t input, dma_addr_t output
 	/* B/G/R rows, signed 11-bit coefficients, eight fractional bits.
 	 * Full-range BT.601 defaults are replaced by limited-range BT.709.
 	 */
-	tdp_write(tdp, 0x250, 1);
+	tdp_write(tdp, 0x250, yuv_out ? 0 : 1);
 	tdp_write(tdp, 0x254, cy);
 	tdp_write(tdp, 0x258, bu);
 	tdp_write(tdp, 0x25c, 0);
@@ -220,12 +229,13 @@ static void tdp_program(struct tdp_ctx *ctx, dma_addr_t input, dma_addr_t output
 	/* Input offsets are subtracted before CSC. Chroma is centred by the
 	 * packed-YUYV reader; subtract the limited-range luma pedestal here.
 	 */
-	tdp_write(tdp, 0x278, limited ? 16 : 0);
+	tdp_write(tdp, 0x278, !yuv_out && limited ? 16 : 0);
 	for (i = 0x27c; i <= 0x28c; i += 4)
 		tdp_write(tdp, i, 0);
 	tdp_write(tdp, 0x29c, 1);
 	tdp_write(tdp, 0x2a0, 1);
-	tdp_write(tdp, 0x2a4, 0x28); /* little-endian RGB565 */
+	/* 0x28: little-endian RGB565, 0x13: packed YUYV (same code as the reader) */
+	tdp_write(tdp, 0x2a4, yuv_out ? 0x13 : 0x28);
 	tdp_write(tdp, 0x2a8, 0);
 	tdp_write(tdp, 0x2ac, output);
 	tdp_write(tdp, 0x2b0, dst_stride);
@@ -248,7 +258,7 @@ static int tdp_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 	if (out && mp->pixelformat != V4L2_PIX_FMT_NV12)
 		mp->pixelformat = V4L2_PIX_FMT_YUYV;
-	if (!out)
+	if (!out && mp->pixelformat != V4L2_PIX_FMT_YUYV)
 		mp->pixelformat = V4L2_PIX_FMT_RGB565;
 	mp->width = clamp_t(u32, mp->width, 2, TDP_MAX_W) & ~1;
 	mp->height = clamp_t(u32, mp->height, 2, TDP_MAX_H);
@@ -287,7 +297,9 @@ static int tdp_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 		mp->colorspace = ctx->src.colorspace;
 		mp->ycbcr_enc = ctx->src.ycbcr_enc;
-		mp->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+		/* RGB is always full range; YUYV keeps the source's range. */
+		mp->quantization = mp->pixelformat == V4L2_PIX_FMT_YUYV ?
+			ctx->src.quantization : V4L2_QUANTIZATION_FULL_RANGE;
 	}
 	if (!mp->xfer_func)
 		mp->xfer_func = V4L2_MAP_XFER_FUNC_DEFAULT(mp->colorspace);
@@ -338,9 +350,9 @@ static int tdp_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 			return -EINVAL;
 		f->pixelformat = f->index ? V4L2_PIX_FMT_NV12 : V4L2_PIX_FMT_YUYV;
 	} else {
-		if (f->index)
+		if (f->index > 1)
 			return -EINVAL;
-		f->pixelformat = V4L2_PIX_FMT_RGB565;
+		f->pixelformat = f->index ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_RGB565;
 	}
 	return 0;
 }
@@ -681,6 +693,30 @@ static int tdp_probe(struct platform_device *pdev)
 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(tdp->clocks), tdp->clocks);
 	if (ret)
 		return dev_err_probe(dev, ret, "clocks\n");
+	if (mm_rate) {
+		/* The datapath is clocked from the MM global mux (clk_mm_glb_sel), which
+		 * boots at 24 MHz and limits throughput to ~94 Mpix/s (1080p at ~45 FPS).
+		 * The DT does not reference it, so find it through its clock provider. */
+		struct device_node *np = of_find_compatible_node(NULL, NULL, "axera,ax620x-mm-clk");
+
+		if (np) {
+			struct of_phandle_args ca = { .np = np, .args_count = 1,
+						      .args = { AX620X_CLK_MM_GLB_SEL } };
+			struct clk *glb = of_clk_get_from_provider(&ca);
+
+			of_node_put(np);
+			if (!IS_ERR(glb)) {
+				if (clk_get_rate(glb) < mm_rate)
+					ret = clk_set_rate(glb, mm_rate);
+				else
+					ret = 0;
+				if (ret)
+					dev_warn(dev, "cannot set MM clock to %lu Hz: %d\n", mm_rate, ret);
+				dev_info(dev, "MM clock %lu Hz\n", clk_get_rate(glb));
+				clk_put(glb);
+			}
+		}
+	}
 	tdp->resets = devm_reset_control_array_get_exclusive(dev);
 	if (IS_ERR(tdp->resets))
 		return dev_err_probe(dev, PTR_ERR(tdp->resets), "resets\n");
