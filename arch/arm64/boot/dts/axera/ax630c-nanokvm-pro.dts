@@ -194,6 +194,14 @@
 	no-mmc;
 	non-removable;
 	cap-sd-highspeed;
+	/* Match the vendor SDIO PHY timings, including legacy CIS reads. */
+	cdns,phy-input-delay-sd-highspeed = <4>;
+	cdns,phy-input-delay-legacy = <3>;
+	cdns,phy-input-delay-sd-uhs-sdr12 = <3>;
+	cdns,phy-input-delay-sd-uhs-sdr25 = <2>;
+	cdns,phy-input-delay-sd-uhs-sdr50 = <1>;
+	cdns,phy-input-delay-sd-uhs-ddr50 = <1>;
+	cdns,phy-dll-delay-sdclk = <0>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&sdio_clk_pins &sdio_cmd_pins &sdio_dat0_pins
 		     &sdio_dat1_pins &sdio_dat2_pins &sdio_dat3_pins>;
