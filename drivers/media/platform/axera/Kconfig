@@ -68,3 +68,23 @@ config VIDEO_AX630C_VC8000E
 	  Open replacement for the vendor ax_venc blob. To compile this driver
 	  as a module, choose M here: the module will be called
 	  ax630c_venc_vcmd.
+
+config VIDEO_AX620E_EXTERNAL_MEDIA
+	tristate "Kernel support for the external AX620E media modules"
+	depends on V4L_PLATFORM_DRIVERS && VIDEO_DEV && OF && HAS_DMA
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	select V4L2_FWNODE
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_CORE
+	select VIDEOBUF2_V4L2
+	select VIDEOBUF2_MEMOPS
+	select VIDEOBUF2_DMA_CONTIG
+	select DMA_SHARED_BUFFER
+	select MFD_SYSCON
+	help
+	  Builds nothing itself. Enables the V4L2, media controller and
+	  videobuf2 helpers that the CSI-2, VIN capture, VC8000E command
+	  engine and TDP modules from osdrv-ax620e link against, for a
+	  configuration that builds those drivers out of tree instead of
+	  the in-tree ones above.
