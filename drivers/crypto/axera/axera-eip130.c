@@ -6,6 +6,7 @@
  * reset and poisoned: no buffer can be reused by a later request while
  * an old DMA might still be outstanding. A root-only sysfs command can
  * reinitialize a poisoned engine while holding the same worker mutex.
+ * The TRNG shares the mailbox, mutex and output buffer with AES.
  */
 #include <crypto/aes.h>
 #include <crypto/engine.h>
@@ -18,6 +19,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/hw_random.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -56,6 +58,9 @@
 #define FW_CHECKED BIT(22)
 #define FW_ACCEPTED BIT(23)
 #define FATAL_ERROR BIT(31)
+#define TRNG_OPCODE (4U << 24)
+#define TRNG_CONFIGURE (1U << 28)
+#define TRNG_MAX SZ_4K
 
 struct ax_dev {
 	struct device *dev;
@@ -64,12 +69,15 @@ struct ax_dev {
 	struct reset_control *resets;
 	struct crypto_engine *engine;
 	struct miscdevice misc;
+	struct hwrng rng;
 	struct completion done;
 	struct mutex lock;
 	int irq;
 	u16 sequence;
 	bool poisoned;
 	bool stopping;
+	bool rng_configured;
+	bool rng_registered;
 	u32 result_status;
 	u8 *input, *output;
 	dma_addr_t input_dma, output_dma;
@@ -634,6 +642,93 @@ static const struct file_operations ax_native_fops = {
 	.compat_ioctl = compat_ptr_ioctl,
 };
 
+#if IS_REACHABLE(CONFIG_HW_RANDOM)
+/* Token layout and the configuration (reseed, 1 sample cycle, divider 0,
+ * 8 noise blocks, no automatic reseed) follow the Axera SDK cipher driver.
+ * The caller holds ce->lock. An engine reset loses the configuration.
+ */
+static int ax_rng_configure(struct ax_dev *ce)
+{
+	u32 token[TOKEN_WORDS] = {};
+	int err;
+
+	if (ce->rng_configured)
+		return 0;
+	token[0] = TRNG_OPCODE | TRNG_CONFIGURE;
+	token[2] = BIT(1) | BIT(0);
+	token[3] = (1U << 16) | 8;
+	err = ax_exchange(ce, token);
+	if (!err)
+		ce->rng_configured = true;
+	return err;
+}
+
+static int ax_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
+{
+	struct ax_dev *ce = container_of(rng, struct ax_dev, rng);
+	size_t size = min_t(size_t, max, TRNG_MAX);
+	u32 token[TOKEN_WORDS] = {};
+	int err;
+
+	/* hwrng passes a multiple of 4 bytes, at least 32. */
+	if (wait)
+		mutex_lock(&ce->lock);
+	else if (!mutex_trylock(&ce->lock))
+		return 0;
+	if (ce->stopping || ce->poisoned) {
+		err = -EIO;
+		goto out;
+	}
+	err = ax_rng_configure(ce);
+	if (err)
+		goto out;
+	token[0] = TRNG_OPCODE;
+	token[2] = size;
+	token[3] = lower_32_bits(ce->output_dma);
+	token[4] = upper_32_bits(ce->output_dma);
+	err = ax_exchange(ce, token);
+	if (!err) {
+		memcpy(data, ce->output, size);
+		err = size;
+	}
+	memzero_explicit(ce->output, size);
+out:
+	mutex_unlock(&ce->lock);
+	return err;
+}
+
+/* The TRNG is optional: AES keeps working when it is unavailable. */
+static void ax_rng_register(struct ax_dev *ce)
+{
+	int err;
+
+	mutex_lock(&ce->lock);
+	err = ax_rng_configure(ce);
+	mutex_unlock(&ce->lock);
+	if (err) {
+		dev_warn(ce->dev, "TRNG unavailable (%d)\n", err);
+		return;
+	}
+	ce->rng = (struct hwrng) { .name = "axera-eip130", .read = ax_rng_read };
+	err = hwrng_register(&ce->rng);
+	if (err) {
+		dev_warn(ce->dev, "hwrng registration failed (%d)\n", err);
+		return;
+	}
+	ce->rng_registered = true;
+}
+
+static void ax_rng_unregister(struct ax_dev *ce)
+{
+	if (ce->rng_registered)
+		hwrng_unregister(&ce->rng);
+	ce->rng_registered = false;
+}
+#else
+static void ax_rng_register(struct ax_dev *ce) {}
+static void ax_rng_unregister(struct ax_dev *ce) {}
+#endif
+
 static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct ax_dev *ce = dev_get_drvdata(dev);
@@ -676,6 +771,7 @@ static ssize_t recover_store(struct device *dev, struct device_attribute *attr,
 		ax_quiesce(ce);
 	else {
 		atomic64_inc(&ce->recoveries);
+		ce->rng_configured = false;
 		WRITE_ONCE(ce->poisoned, false);
 	}
 out:
@@ -773,7 +869,9 @@ static int ax_probe(struct platform_device *pdev)
 		device_remove_file(dev, &dev_attr_stats);
 		goto unregister;
 	}
-	dev_info(dev, "EIP-130 AES ECB/CBC/CTR, mailbox 2, IRQ %d\n", ce->irq);
+	ax_rng_register(ce);
+	dev_info(dev, "EIP-130 AES ECB/CBC/CTR%s, mailbox 2, IRQ %d\n",
+		 ce->rng_registered ? ", TRNG" : "", ce->irq);
 	return 0;
 unregister:
 	while (i--)
@@ -797,6 +895,7 @@ static void ax_remove(struct platform_device *pdev)
 	struct ax_dev *ce = platform_get_drvdata(pdev);
 	unsigned int i;
 
+	ax_rng_unregister(ce);
 	misc_deregister(&ce->misc);
 	device_remove_file(&pdev->dev, &dev_attr_stats);
 	device_remove_file(&pdev->dev, &dev_attr_recover);
