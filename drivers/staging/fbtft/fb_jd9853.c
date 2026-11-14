@@ -3,6 +3,9 @@
  * Jadard JD9853, the NanoKVM Pro Desk 172x320 panel.
  *
  * Register sequence is the Sipeed 4.19 fb_jd9853 init (iawak9lkm), run twice.
+ * OneKVM U-Boot runs the same sequence, draws its logo and marks the panel
+ * onekvm,boot-logo; then the panel is not reset and keeps that logo until
+ * user space draws the first frame.
  * The panel is a 172-column window at column offset 0x22 on a 240-column
  * controller. Unchanged frames are skipped; changed rows use a matching window.
  * No tearing-effect
@@ -18,6 +21,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <video/mipi_display.h>
 
@@ -40,6 +44,7 @@ struct jd9853_frame {
 	u8 *snapshot;
 	u8 *last;
 	bool valid;
+	bool boot_logo;
 };
 
 static int set_var(struct fbtft_par *par)
@@ -137,6 +142,14 @@ static void update_display(struct fbtft_par *par, unsigned int start_line,
 	unsigned int first, row, height = info->var.yres;
 	int ret;
 
+	/* fbtft's first update sends the empty buffer before user space can
+	 * draw. Keep the boot logo instead.
+	 */
+	if (frame->boot_logo) {
+		frame->boot_logo = false;
+		return;
+	}
+
 	/* fbdev page damage can cover unchanged rows. Compare actual pixels,
 	 * including disjoint runs such as the clock's old and new second dot.
 	 */
@@ -211,6 +224,12 @@ static int init_display(struct fbtft_par *par)
 	}
 	frame->valid = false;
 	par->first_update_done = false;
+
+	/* A reset would blank the bootloader's logo until the first frame. */
+	if (device_property_read_bool(par->info->device, "onekvm,boot-logo")) {
+		frame->boot_logo = true;
+		return 0;
+	}
 
 	for (i = 0; i < 2; i++) {
 		mdelay(100);
