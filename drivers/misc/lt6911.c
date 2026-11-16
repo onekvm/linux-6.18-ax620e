@@ -165,6 +165,20 @@
  */
 #define LT6911_DETECT_DEBOUNCE_MS	50
 
+/*
+ * Interval of the published-state check against the live RX timing. A
+ * disagreement must be seen on two consecutive checks before it is acted on,
+ * which leaves a mode change the full interval to deliver its own interrupt.
+ */
+#define LT6911_WATCH_MS			1000
+
+/*
+ * Smallest RX active size taken as a mode. A signal that comes and goes too
+ * fast to lock leaves residue such as 52x2 or 4x5 in the size registers.
+ */
+#define LT6911_RX_MIN_WIDTH		320
+#define LT6911_RX_MIN_HEIGHT		200
+
 /* The chip is left alone for this long between back-to-back EDID reads. */
 #define LT6911_EDID_READ_INTERVAL_MS	500
 
@@ -239,6 +253,7 @@ struct lt6911 {
 
 	struct work_struct info_work;
 	struct delayed_work detect_work;
+	struct delayed_work watch_work;
 
 	/*
 	 * chip_lock serialises everything that touches the bridge: the bank
@@ -281,6 +296,21 @@ struct lt6911 {
 	/* Last geometry check_res() saw, for the new-versus-unchanged test. */
 	u16 last_width;
 	u16 last_height;
+
+	/*
+	 * The published video geometry, 0x0 when status reports no usable
+	 * signal. Kept beside the /proc text so the watch work can compare it
+	 * without parsing; written under buf_lock.
+	 */
+	u16 pub_width;
+	u16 pub_height;
+
+	/*
+	 * Watch work only: the disagreement awaiting confirmation, and the
+	 * last one already acted on. 0 means none.
+	 */
+	u64 watch_pending;
+	u64 watch_done;
 
 	wait_queue_head_t wq;
 	atomic_t status_gen;
@@ -2159,6 +2189,8 @@ static void lt6911_force_resolution(struct lt6911 *lt, u16 width, u16 height,
 	lt6911_set_text(&lt->width, "%d\n", width);
 	lt6911_set_text(&lt->height, "%d\n", height);
 	lt6911_set_text(&lt->fps, "%d\n", fps > 0 ? fps : 30);
+	lt->pub_width = width;
+	lt->pub_height = height;
 	mutex_unlock(&lt->buf_lock);
 
 	lt6911_bump_status(lt);
@@ -2182,6 +2214,8 @@ static int lt6911_video_stable(struct lt6911 *lt)
 		lt6911_set_text(&lt->status, "error res\n");
 		lt6911_set_text(&lt->width, "%d\n", 0);
 		lt6911_set_text(&lt->height, "%d\n", 0);
+		lt->pub_width = 0;
+		lt->pub_height = 0;
 		mutex_unlock(&lt->buf_lock);
 		dev_err(lt->dev, "bad resolution %ux%u\n", width, height);
 		return -EIO;
@@ -2200,6 +2234,8 @@ static int lt6911_video_stable(struct lt6911 *lt)
 	lt6911_set_text(&lt->status, "new res\n");
 	lt6911_set_text(&lt->width, "%d\n", width);
 	lt6911_set_text(&lt->height, "%d\n", height);
+	lt->pub_width = width;
+	lt->pub_height = height;
 	mutex_unlock(&lt->buf_lock);
 
 	if (lt->chip == LT6911_CHIP_UXC) {
@@ -2248,6 +2284,8 @@ static void lt6911_video_lost(struct lt6911 *lt, bool known)
 	lt6911_set_text(&lt->fps, "%d\n", 0);
 	lt6911_set_text(&lt->hdcp, known && lt->chip == LT6911_CHIP_UXC ?
 			 "no hdcp\n" : "unknown hdcp\n");
+	lt->pub_width = 0;
+	lt->pub_height = 0;
 	mutex_unlock(&lt->buf_lock);
 
 	lt6911_bump_status(lt);
@@ -2348,6 +2386,102 @@ static void lt6911_detect_work_fn(struct work_struct *work)
 	lt6911_update_detect(lt);
 }
 
+/*
+ * The UXC reports each signal change with one short pulse on its interrupt
+ * line, and the interrupt thread acts only if the line still reads asserted
+ * when it runs. A pulse that has already ended by then is dropped, and the
+ * published state stays wrong until the next change: "disappear" while a
+ * host woken from sleep is sending video, or a stale mode while nothing
+ * arrives at all.
+ *
+ * The RX active size is measured live: 0x0 without a signal, or residue below
+ * LT6911_RX_MIN_* after one too brief to lock. It is compared with the
+ * published geometry. A disagreement seen on two consecutive checks is
+ * resolved once: RX without a usable size publishes the loss directly; RX
+ * timing that the published state lacks re-runs the interrupt path, which
+ * reads the bridge's own verdict and the CSI geometry. If that
+ * verdict does not settle it, the same disagreement is not retried, so a
+ * bridge that never agrees costs one re-read per change, not one a second.
+ *
+ * Only the UXC is watched; the C and D variants are untested on this path.
+ */
+static void lt6911_watch_work_fn(struct work_struct *work)
+{
+	struct lt6911 *lt = container_of(work, struct lt6911,
+					 watch_work.work);
+	u16 width = 0, height = 0, pub_width, pub_height;
+	bool rx_video, lost = false, reread = false;
+	u64 sig;
+	int ret, disable_ret;
+
+	mutex_lock(&lt->chip_lock);
+	if (!lt->powered || (force_width > 0 && force_height > 0)) {
+		mutex_unlock(&lt->chip_lock);
+		lt->watch_pending = 0;
+		goto out;
+	}
+	ret = lt6911_enable(lt);
+	if (!ret) {
+		ret = lt6911_get_rx_geometry(lt, &width, &height);
+		disable_ret = lt6911_disable(lt);
+		if (!ret)
+			ret = disable_ret;
+	}
+	if (ret) {
+		mutex_unlock(&lt->chip_lock);
+		goto out;
+	}
+
+	mutex_lock(&lt->buf_lock);
+	pub_width = lt->pub_width;
+	pub_height = lt->pub_height;
+	mutex_unlock(&lt->buf_lock);
+
+	rx_video = width >= LT6911_RX_MIN_WIDTH &&
+		   height >= LT6911_RX_MIN_HEIGHT;
+	if (rx_video ? width == pub_width && height == pub_height :
+		       !pub_width || !pub_height) {
+		lt->watch_pending = 0;
+		lt->watch_done = 0;
+		mutex_unlock(&lt->chip_lock);
+		goto out;
+	}
+
+	sig = (u64)width << 48 | (u64)height << 32 |
+	      (u64)pub_width << 16 | pub_height;
+	if (sig == lt->watch_done) {
+		mutex_unlock(&lt->chip_lock);
+		goto out;
+	}
+	if (sig != lt->watch_pending) {
+		lt->watch_pending = sig;
+		mutex_unlock(&lt->chip_lock);
+		goto out;
+	}
+	lt->watch_pending = 0;
+	lt->watch_done = sig;
+
+	if (rx_video)
+		reread = true;
+	else
+		lost = true;
+	mutex_unlock(&lt->chip_lock);
+
+	dev_info(lt->dev, "missed signal change: RX %ux%u, published %ux%u\n",
+		 width, height, pub_width, pub_height);
+	if (lost) {
+		lt6911_video_lost(lt, true);
+		mutex_lock(&lt->buf_lock);
+		lt6911_set_text(&lt->asr, "disappear\n");
+		mutex_unlock(&lt->buf_lock);
+	}
+	if (reread)
+		schedule_work(&lt->info_work);
+out:
+	mod_delayed_work(system_wq, &lt->watch_work,
+			 msecs_to_jiffies(LT6911_WATCH_MS));
+}
+
 /* --- interrupts ---------------------------------------------------------- */
 
 /*
@@ -2363,6 +2497,9 @@ static irqreturn_t lt6911_int_thread(int irq, void *data)
 	/* DT is active-low for the board's UXC/D; C signals on the other edge. */
 	if (asserted >= 0 && !!asserted == (lt->chip != LT6911_CHIP_C))
 		schedule_work(&lt->info_work);
+	else if (lt->chip == LT6911_CHIP_UXC)
+		/* The pulse may have ended unseen; check against RX now. */
+		mod_delayed_work(system_wq, &lt->watch_work, 0);
 
 	return IRQ_HANDLED;
 }
@@ -2469,6 +2606,8 @@ static ssize_t lt6911_power_write(struct file *file, const char __user *ubuf,
 	if (!on) {
 		mutex_lock(&lt->buf_lock);
 		lt6911_set_text(&lt->status, "disappear\n");
+		lt->pub_width = 0;
+		lt->pub_height = 0;
 		mutex_unlock(&lt->buf_lock);
 		lt6911_bump_status(lt);
 	} else {
@@ -3224,7 +3363,8 @@ static int lt6911_request_irqs(struct lt6911 *lt)
 	/*
 	 * Both edges on all three lines. The handlers read the pin rather
 	 * than trusting the edge, so a missed or coalesced transition
-	 * resynchronises on the next one.
+	 * resynchronises on the next one. The UXC interrupt is a pulse with
+	 * no next one; its misses are caught by the watch work.
 	 *
 	 * These are deliberately not devm_: devm frees IRQs after remove()
 	 * returns, which would leave a window where a late interrupt requeues
@@ -3328,6 +3468,7 @@ static int lt6911_probe(struct i2c_client *client)
 	 */
 	INIT_WORK(&lt->info_work, lt6911_info_work_fn);
 	INIT_DELAYED_WORK(&lt->detect_work, lt6911_detect_work_fn);
+	INIT_DELAYED_WORK(&lt->watch_work, lt6911_watch_work_fn);
 
 	lt6911_init_text(lt);
 
@@ -3447,11 +3588,15 @@ static int lt6911_probe(struct i2c_client *client)
 	}
 	dev_info(dev, "ready\n");
 	schedule_work(&lt->info_work);
+	if (lt->chip == LT6911_CHIP_UXC)
+		schedule_delayed_work(&lt->watch_work,
+				      msecs_to_jiffies(LT6911_WATCH_MS));
 
 	return 0;
 
 err_irq:
 	lt6911_free_irqs(lt);
+	cancel_delayed_work_sync(&lt->watch_work);
 	cancel_work_sync(&lt->info_work);
 	cancel_delayed_work_sync(&lt->detect_work);
 err_power:
@@ -3476,9 +3621,11 @@ static void lt6911_remove(struct i2c_client *client)
 	/*
 	 * Interrupts first, then the work they queue, then the files that can
 	 * reach the chip. Any other order leaves something able to run after
-	 * the thing it touches is gone.
+	 * the thing it touches is gone. The watch queues the info work, so it
+	 * goes before it.
 	 */
 	lt6911_free_irqs(lt);
+	cancel_delayed_work_sync(&lt->watch_work);
 	cancel_work_sync(&lt->info_work);
 	cancel_delayed_work_sync(&lt->detect_work);
 	lt6911_proc_exit(lt);
