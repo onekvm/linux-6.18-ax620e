@@ -28,6 +28,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #define LT7911_PAGE_SELECT			0xff
 
@@ -39,6 +40,7 @@
 
 #define LT7911EXC_INFO_OFFSET		0xe0
 #define LT7911EXC_INT_TYPE			0x84
+#define LT7911EXC_ID_OFFSET			0xe1
 #define LT7911EXC_INT_VIDEO_OFF		0x00
 #define LT7911EXC_INT_VIDEO_READY	0x01
 #define LT7911EXC_INT_AUDIO_OFF		0x02
@@ -50,6 +52,28 @@
 #define LT7911EXC_EDID_ADDR		0x60000
 #define LT7911EXC_EDID_BLOCK_SIZE	128
 #define LT7911EXC_EDID_MAX_SIZE	512
+/* SPI NOR 4 KiB sector erase; the EDID block holds nothing past 512 bytes. */
+#define LT7911EXC_SECTOR_SIZE		SZ_4K
+#define LT7911EXC_SECTOR_ERASE		0x20
+/* Typical sector erase time; completion is checked by reading back. */
+#define LT7911EXC_ERASE_WAIT_MS		50
+/* Firmware RX state mirrored in E0AE (no E0EE needed to read it). */
+#define LT7911EXC_RX_STATE		0xae
+#define LT7911EXC_RX_NO_INPUT		0x02
+#define LT7911EXC_RX_SHADOW_LOADING	0x04
+#define LT7911EXC_RX_SHADOW_LOADED	0x05
+/* EDID Shadow load port, page C2; access needs E0EE=1. */
+#define LT7911EXC_SHADOW_OFFSET		0xc2
+#define LT7911EXC_SHADOW_CTRL		0x00
+#define LT7911EXC_SHADOW_MODE		0x02
+#define LT7911EXC_SHADOW_SELECT		0x05
+#define LT7911EXC_SHADOW_DATA		0x0e
+#define LT7911EXC_SHADOW_SIZE		512
+#define LT7911EXC_SHADOW_WAIT_MS	20000
+#define LT7911EXC_SHADOW_LOAD_WAIT_MS	2000
+#define LT7911EXC_SHADOW_WATCH_MS	100
+#define LT7911EXC_SHADOW_TRIES		2
+#define LT7911EXC_ERASE_TRIES		10
 
 #define LT7911_REG(page, reg)		(((page) << 8) | (reg))
 
@@ -67,6 +91,7 @@
 #define PROC_AUDIO_SAMPLE_RATE		"asr"
 #define PROC_VIDEO_EDID				"edid"
 #define PROC_VIDEO_EDID_SNAPSHOT	"edid_snapshot"
+#define PROC_VIDEO_EDID_SHADOW		"edid_shadow"
 #define PROC_VERSION				"version"
 #define PROC_FW_UPDATE				"fw_update"
 
@@ -162,6 +187,11 @@ struct lt7911_data {
 
 	u16 last_width;
 	u16 last_height;
+
+	/* Temporary EDID, guarded by exc_lock; 0 serves the Flash EDID. */
+	struct delayed_work shadow_work;
+	u8 shadow_edid[LT7911EXC_EDID_MAX_SIZE];
+	size_t shadow_len;
 };
 
 struct lt7911_video_info {
@@ -251,8 +281,15 @@ static int lt7911_bulk_read(struct lt7911_data *lt7911, u8 page, u8 reg,
 				len);
 }
 
+static void lt7911_mark_no_signal(struct lt7911_data *lt7911);
+
 static int lt7911_power_set(struct lt7911_data *lt7911, bool on)
 {
+	bool was_on = gpiod_get_value_cansleep(lt7911->reset_gpio) > 0;
+
+	/* Leaving reset restarts the firmware, which re-reports the signal. */
+	if (!on || !was_on)
+		lt7911_mark_no_signal(lt7911);
 	gpiod_set_value_cansleep(lt7911->reset_gpio, on);
 	msleep(on ? 400 : 20);
 
@@ -267,6 +304,11 @@ static int lt7911_power_set(struct lt7911_data *lt7911, bool on)
 
 static int lt7911_reset_sequence(struct lt7911_data *lt7911)
 {
+	/*
+	 * The restarted firmware takes several seconds to bring the input
+	 * back; until it interrupts, the last mode no longer describes it.
+	 */
+	lt7911_mark_no_signal(lt7911);
 	gpiod_set_value_cansleep(lt7911->reset_gpio, 0);
 	msleep(20);
 
@@ -338,7 +380,29 @@ static int lt7911d_check_chip(struct lt7911_data *lt7911)
 static int lt7911exc_check_chip(struct lt7911_data *lt7911)
 {
 	u8 fw_version[3];
+	u8 chip_id[3];
+	int unlock_ret;
 	int ret;
+
+	/* The ID page is readable only while register access is enabled. */
+	ret = lt7911_write(lt7911, LT7911EXC_INFO_OFFSET, 0xee, 0x01);
+	if (!ret)
+		ret = lt7911_bulk_read(lt7911, LT7911EXC_ID_OFFSET, 0x00,
+				       chip_id, sizeof(chip_id));
+	unlock_ret = lt7911_write(lt7911, LT7911EXC_INFO_OFFSET, 0xee, 0x00);
+	if (!ret)
+		ret = unlock_ret;
+	if (ret) {
+		dev_err(lt7911->dev, "Failed to read LT7911EXC chip id: %d\n",
+			ret);
+		return ret;
+	}
+	if (chip_id[0] != 0x24 || chip_id[1] != 0x08) {
+		dev_err(lt7911->dev, "Unexpected chip id %02x %02x %02x\n",
+			chip_id[0], chip_id[1], chip_id[2]);
+		lt7911->chip = LT7911_CHIP_UNKNOWN;
+		return -ENODEV;
+	}
 
 	ret = lt7911_bulk_read(lt7911, 0xe0, 0x81, fw_version,
 			       sizeof(fw_version));
@@ -503,7 +567,12 @@ static int lt7911exc_block_erase_fw(struct lt7911_data *lt7911)
 	return 0;
 }
 
-static int lt7911exc_block_erase_at(struct lt7911_data *lt7911, u32 addr)
+/*
+ * Start a 4 KiB sector erase at @addr: write enable, then the opcode with a
+ * 24-bit address. The SPI status register does not read back through this
+ * window, so the caller waits for erased contents instead.
+ */
+static int lt7911exc_sector_erase_at(struct lt7911_data *lt7911, u32 addr)
 {
 	struct reg_sequence seq[] = {
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0xee), 0x01 },
@@ -512,7 +581,8 @@ static int lt7911exc_block_erase_at(struct lt7911_data *lt7911, u32 addr)
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x51), 0x01 },
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x51), 0x00 },
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x54), 0x05 },
-		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x55), 0xd8 },
+		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x55),
+		  LT7911EXC_SECTOR_ERASE },
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x5a),
 		  (addr >> 16) & 0xff },
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x5b),
@@ -521,14 +591,8 @@ static int lt7911exc_block_erase_at(struct lt7911_data *lt7911, u32 addr)
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x51), 0x01 },
 		{ LT7911_REG(LT7911EXC_INFO_OFFSET, 0x51), 0x00 },
 	};
-	int ret;
 
-	ret = regmap_multi_reg_write(lt7911->regmap, seq, ARRAY_SIZE(seq));
-	if (ret)
-		return ret;
-
-	msleep(200);
-	return 0;
+	return regmap_multi_reg_write(lt7911->regmap, seq, ARRAY_SIZE(seq));
 }
 
 static int lt7911exc_prog_init_fw(struct lt7911_data *lt7911, u32 addr)
@@ -613,7 +677,9 @@ static int lt7911exc_reset_fifo(struct lt7911_data *lt7911)
 	if (ret)
 		return ret;
 
-	msleep(1000);
+	/* Reads straight after the reset return correct data on LT7911EXC;
+	 * the vendor driver waited a full second here. */
+	usleep_range(1000, 2000);
 	return 0;
 }
 
@@ -765,16 +831,54 @@ static int lt7911exc_read_edid(struct lt7911_data *lt7911, u8 *edid)
 	return ret ? ret : unlock_ret;
 }
 
-/* 0xd8 erases a whole 64 KiB sector; preserve every byte outside EDID. */
-static int lt7911exc_write_edid(struct lt7911_data *lt7911, const u8 *edid,
-                               size_t len)
+/* Wait until the erased @sector reads blank wherever @image has data. */
+static int lt7911exc_wait_erased(struct lt7911_data *lt7911, const u8 *image,
+				 u8 *readback)
 {
+	const size_t page = LT7911EXC_FW_PAGE_SIZE;
+	unsigned int tries;
+	size_t offset;
+	int ret;
+
+	for (tries = 0; tries < LT7911EXC_ERASE_TRIES; tries++) {
+		msleep(LT7911EXC_ERASE_WAIT_MS);
+		for (offset = 0; offset < LT7911EXC_SECTOR_SIZE; offset += page) {
+			if (!memchr_inv(image + offset, 0xff, page))
+				continue;
+			ret = lt7911exc_read_data_at(lt7911,
+						     LT7911EXC_EDID_ADDR + offset,
+						     readback + offset, page);
+			if (ret)
+				return ret;
+			if (memchr_inv(readback + offset, 0xff, page))
+				break;
+		}
+		if (offset == LT7911EXC_SECTOR_SIZE)
+			return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+/*
+ * The firmware loads EDID from the first 512 bytes of the 64 KiB block at
+ * LT7911EXC_EDID_ADDR; the rest of that block is blank on shipped bridges.
+ * Erase only the 4 KiB sector holding EDID, write back whatever else that
+ * sector holds, and program only pages with data.
+ *
+ * Returns 1 when Flash already holds @edid and nothing was written, 0 after
+ * a verified write followed by a bridge reset, which reloads EDID.
+ */
+static int lt7911exc_write_edid(struct lt7911_data *lt7911, const u8 *edid,
+				size_t len)
+{
+	const size_t size = LT7911EXC_SECTOR_SIZE;
+	const size_t page = LT7911EXC_FW_PAGE_SIZE;
 	u8 *sector, *readback;
-	const size_t sector_size = SZ_64K;
+	size_t offset;
 	int ret, unlock_ret;
 
-	sector = kvmalloc(sector_size, GFP_KERNEL);
-	readback = kvmalloc(sector_size, GFP_KERNEL);
+	sector = kmalloc(size, GFP_KERNEL);
+	readback = kmalloc(size, GFP_KERNEL);
 	if (!sector || !readback) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -782,38 +886,227 @@ static int lt7911exc_write_edid(struct lt7911_data *lt7911, const u8 *edid,
 	ret = lt7911_write(lt7911, LT7911EXC_INFO_OFFSET, 0xee, 0x01);
 	if (ret)
 		goto out_free;
-	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, sector, sector_size);
+	/* Compare EDID alone first: rewriting the current EDID is common. */
+	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, readback, len);
 	if (ret)
 		goto out_unlock;
-	if (!memcmp(sector, edid, len))
+	if (!memcmp(readback, edid, len)) {
+		ret = 1;
 		goto out_unlock;
-	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, readback, sector_size);
+	}
+	/* The rest of the sector is written back: require two equal reads. */
+	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, sector, size);
 	if (ret)
 		goto out_unlock;
-	if (memcmp(sector, readback, sector_size)) {
+	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, readback, size);
+	if (ret)
+		goto out_unlock;
+	if (memcmp(sector, readback, size)) {
 		ret = -EIO;
 		goto out_unlock;
 	}
 	memcpy(sector, edid, len);
-	ret = lt7911exc_block_erase_at(lt7911, LT7911EXC_EDID_ADDR);
+	ret = lt7911exc_sector_erase_at(lt7911, LT7911EXC_EDID_ADDR);
 	if (ret)
 		goto out_unlock;
-	ret = lt7911exc_write_data_at(lt7911, LT7911EXC_EDID_ADDR, sector, sector_size);
+	ret = lt7911exc_wait_erased(lt7911, sector, readback);
 	if (ret)
 		goto out_unlock;
-	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, readback, sector_size);
-	if (!ret && memcmp(readback, sector, sector_size))
+	for (offset = 0; offset < size; offset += page) {
+		if (!memchr_inv(sector + offset, 0xff, page))
+			continue;
+		ret = lt7911exc_write_data_at(lt7911, LT7911EXC_EDID_ADDR + offset,
+					      sector + offset, page);
+		if (ret)
+			goto out_unlock;
+	}
+	ret = lt7911exc_read_data_at(lt7911, LT7911EXC_EDID_ADDR, readback, size);
+	if (!ret && memcmp(readback, sector, size))
 		ret = -EIO;
 out_unlock:
 	unlock_ret = lt7911_write(lt7911, LT7911EXC_INFO_OFFSET, 0xee, 0x00);
-	if (!ret)
+	if (ret >= 0 && unlock_ret)
 		ret = unlock_ret;
 	if (!ret)
 		ret = lt7911_reset(lt7911);
 out_free:
-	kvfree(readback);
-	kvfree(sector);
+	kfree(readback);
+	kfree(sector);
 	return ret;
+}
+
+static void lt7911_set_edid_snapshot(struct lt7911_data *lt7911, const u8 *edid,
+				     size_t len)
+{
+	mutex_lock(&lt7911->state_lock);
+	memcpy(lt7911->video_edid_snapshot, edid, len);
+	lt7911->video_edid_snapshot_len = len;
+	mutex_unlock(&lt7911->state_lock);
+}
+
+/* Forget the temporary EDID; the bridge serves Flash from its next load. */
+static void lt7911exc_drop_shadow(struct lt7911_data *lt7911)
+{
+	if (!lt7911->shadow_len)
+		return;
+	lt7911->shadow_len = 0;
+	mutex_lock(&lt7911->state_lock);
+	if (lt7911->video_edid_len) {
+		memcpy(lt7911->video_edid_snapshot, lt7911->video_edid,
+		       lt7911->video_edid_len);
+		lt7911->video_edid_snapshot_len = lt7911->video_edid_len;
+	}
+	mutex_unlock(&lt7911->state_lock);
+}
+
+/*
+ * The source reads EDID from the Shadow. The firmware fills it from its
+ * power-on copy of Flash each time the input enters DP Alt Mode (state 4),
+ * reports state 5, and the PD task raises HPD tens of milliseconds later.
+ * Wait for state 5 after a fresh load: @loading means state 3 or 4 was
+ * already seen. Returns -EAGAIN when the load was missed and -ENODEV while
+ * no input is attached. Caller holds exc_lock.
+ */
+static int lt7911exc_wait_shadow_load(struct lt7911_data *lt7911,
+				      bool loading, unsigned int timeout_ms)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	u8 state = 0;
+
+	do {
+		if (lt7911_read(lt7911, LT7911EXC_INFO_OFFSET,
+				LT7911EXC_RX_STATE, &state)) {
+			usleep_range(5000, 10000);
+			continue;
+		}
+		if (state == LT7911EXC_RX_SHADOW_LOADED && loading)
+			return 0;
+		if (state > LT7911EXC_RX_NO_INPUT &&
+		    state <= LT7911EXC_RX_SHADOW_LOADING) {
+			loading = true;
+			usleep_range(200, 400);
+			continue;
+		}
+		if (loading)
+			return -EAGAIN;
+		usleep_range(5000, 10000);
+	} while (time_before(jiffies, deadline));
+
+	return state <= LT7911EXC_RX_NO_INPUT ? -ENODEV : -ETIMEDOUT;
+}
+
+/*
+ * Replace the Shadow after the firmware loaded it and before it raised HPD.
+ * E0EE=1 stops the MCU, so HPD waits until the Shadow is rewritten. The
+ * sequence repeats the firmware's own load. Caller holds exc_lock.
+ */
+static int lt7911exc_load_shadow(struct lt7911_data *lt7911)
+{
+	const u8 page = LT7911EXC_SHADOW_OFFSET;
+	u8 ctrl, mode;
+	size_t i;
+	int ret, end_ret;
+
+	ret = lt7911_write(lt7911, LT7911EXC_INFO_OFFSET, 0xee, 0x01);
+	if (ret)
+		return ret;
+	ret = lt7911_read(lt7911, page, LT7911EXC_SHADOW_CTRL, &ctrl);
+	if (!ret)
+		ret = lt7911_read(lt7911, page, LT7911EXC_SHADOW_MODE, &mode);
+	if (ret)
+		goto out;
+	/* Bit 4 stays set while the firmware itself loads the Shadow. */
+	if (mode & BIT(4)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = lt7911_write(lt7911, page, LT7911EXC_SHADOW_MODE, mode | BIT(4));
+	if (!ret)
+		ret = lt7911_write(lt7911, page, LT7911EXC_SHADOW_SELECT, 0x02);
+	for (i = 0; !ret && i < LT7911EXC_SHADOW_SIZE; i++)
+		ret = lt7911_write(lt7911, page, LT7911EXC_SHADOW_DATA,
+				   i < lt7911->shadow_len ?
+				   lt7911->shadow_edid[i] : 0xff);
+	end_ret = lt7911_write(lt7911, page, LT7911EXC_SHADOW_SELECT, 0x00);
+	if (!end_ret)
+		end_ret = lt7911_write(lt7911, page, LT7911EXC_SHADOW_CTRL,
+				       ctrl | BIT(0));
+	if (!end_ret)
+		end_ret = lt7911_write(lt7911, page, LT7911EXC_SHADOW_MODE,
+				       mode & ~BIT(4));
+	if (!ret)
+		ret = end_ret;
+out:
+	end_ret = lt7911_write(lt7911, LT7911EXC_INFO_OFFSET, 0xee, 0x00);
+	return ret ? ret : end_ret;
+}
+
+/*
+ * Present the temporary EDID: restart the bridge when @reset, otherwise
+ * catch the load already in progress. A missed load costs one restart.
+ * Returns -ENODEV while no input is attached; the watch applies it later.
+ * Caller holds exc_lock.
+ */
+static int lt7911exc_apply_shadow(struct lt7911_data *lt7911, bool reset)
+{
+	unsigned int tries;
+	int ret = -EAGAIN;
+
+	for (tries = 0; tries < LT7911EXC_SHADOW_TRIES && ret == -EAGAIN;
+	     tries++) {
+		if (reset || tries) {
+			ret = lt7911_reset(lt7911);
+			if (ret)
+				return ret;
+		}
+		ret = lt7911exc_wait_shadow_load(lt7911, !(reset || tries),
+						 reset || tries ?
+						 LT7911EXC_SHADOW_WAIT_MS :
+						 LT7911EXC_SHADOW_LOAD_WAIT_MS);
+		if (!ret)
+			ret = lt7911exc_load_shadow(lt7911);
+	}
+	if (ret && ret != -ENODEV)
+		dev_warn(lt7911->dev, "Failed to present temporary EDID: %d\n",
+			 ret);
+	return ret;
+}
+
+/*
+ * Reconnecting the source reloads the Shadow from Flash. State 2 lasts
+ * seconds and state 4 0.4 s before the load, so a 100 ms watch sees it.
+ */
+static void lt7911exc_shadow_watch(struct work_struct *work)
+{
+	struct lt7911_data *lt7911 = container_of(to_delayed_work(work),
+						  struct lt7911_data,
+						  shadow_work);
+	u8 state;
+	int ret;
+
+	mutex_lock(&lt7911->exc_lock);
+	if (!lt7911->shadow_len)
+		goto out;
+	if (lt7911_read(lt7911, LT7911EXC_INFO_OFFSET, LT7911EXC_RX_STATE,
+			&state) ||
+	    state <= LT7911EXC_RX_NO_INPUT ||
+	    state > LT7911EXC_RX_SHADOW_LOADING)
+		goto again;
+
+	ret = lt7911exc_apply_shadow(lt7911, false);
+	if (ret && ret != -ENODEV) {
+		/* A partial Shadow must not stay; restart onto Flash EDID. */
+		lt7911exc_drop_shadow(lt7911);
+		lt7911_reset(lt7911);
+		goto out;
+	}
+	if (!ret)
+		dev_info(lt7911->dev, "LT7911EXC temporary EDID restored\n");
+again:
+	queue_delayed_work(system_long_wq, &lt7911->shadow_work,
+			   msecs_to_jiffies(LT7911EXC_SHADOW_WATCH_MS));
+out:
+	mutex_unlock(&lt7911->exc_lock);
 }
 
 static int lt7911exc_run_fw_update(struct lt7911_data *lt7911,
@@ -886,6 +1179,7 @@ static int lt7911_fw_update_run(struct lt7911_data *lt7911)
 
 	disable_irq(lt7911->irq);
 	mutex_lock(&lt7911->exc_lock);
+	lt7911exc_drop_shadow(lt7911);
 	ret = lt7911exc_run_fw_update(lt7911, fw, expected_crc, &actual_crc);
 	mutex_unlock(&lt7911->exc_lock);
 	enable_irq(lt7911->irq);
@@ -1304,33 +1598,44 @@ static ssize_t proc_chip_id_read(struct file *file, char __user *user_buffer,
 				       count, offset);
 }
 
+/*
+ * Copies a short command and trims surrounding whitespace. A shell may write
+ * "on" and its newline separately, so an empty command is a no-op.
+ */
+static int lt7911_proc_command(const char __user *user_buffer, size_t count,
+			       char *buf, size_t size, char **command)
+{
+	if (!count || count >= size)
+		return -EINVAL;
+	if (copy_from_user(buf, user_buffer, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	*command = strim(buf);
+	return 0;
+}
+
 static ssize_t proc_video_power_write(struct file *file,
 				      const char __user *user_buffer,
 				      size_t count, loff_t *offset)
 {
 	struct lt7911_data *lt7911 = pde_data(file_inode(file));
 	char buf[16];
+	char *command;
+	int ret;
 
-	if (count >= sizeof(buf))
-		return -EINVAL;
+	ret = lt7911_proc_command(user_buffer, count, buf, sizeof(buf),
+				  &command);
+	if (ret)
+		return ret;
+	if (!*command)
+		return count;
 
-	if (copy_from_user(buf, user_buffer, count))
-		return -EFAULT;
-	buf[count] = '\0';
-
-	if (!strncmp(buf, "on", 2) || !strncmp(buf, "1", 1)) {
+	if (!strcmp(command, "on") || !strcmp(command, "1"))
 		lt7911_power_set(lt7911, true);
-	} else if (!strncmp(buf, "off", 3) || !strncmp(buf, "0", 1)) {
+	else if (!strcmp(command, "off") || !strcmp(command, "0"))
 		lt7911_power_set(lt7911, false);
-		mutex_lock(&lt7911->state_lock);
-		lt7911->video_status_len = scnprintf(lt7911->video_status,
-						     sizeof(lt7911->video_status),
-						     "disappear\n");
-		mutex_unlock(&lt7911->state_lock);
-		lt7911_notify(lt7911);
-	} else {
+	else
 		return -EINVAL;
-	}
 
 	return count;
 }
@@ -1484,6 +1789,7 @@ static ssize_t proc_video_edid_read(struct file *file,
 {
 	struct lt7911_data *lt7911 = pde_data(file_inode(file));
 	u8 edid[LT7911EXC_EDID_MAX_SIZE];
+	bool shadow;
 	size_t length;
 	int ret;
 
@@ -1498,6 +1804,7 @@ static ssize_t proc_video_edid_read(struct file *file,
 	disable_irq(lt7911->irq);
 	mutex_lock(&lt7911->exc_lock);
 	ret = lt7911exc_read_edid(lt7911, edid);
+	shadow = lt7911->shadow_len;
 	mutex_unlock(&lt7911->exc_lock);
 	enable_irq(lt7911->irq);
 	if (ret)
@@ -1509,8 +1816,11 @@ static ssize_t proc_video_edid_read(struct file *file,
 	mutex_lock(&lt7911->state_lock);
 	memcpy(lt7911->video_edid, edid, length);
 	lt7911->video_edid_len = length;
-	memcpy(lt7911->video_edid_snapshot, edid, length);
-	lt7911->video_edid_snapshot_len = length;
+	/* A temporary EDID stays what the source sees. */
+	if (!shadow) {
+		memcpy(lt7911->video_edid_snapshot, edid, length);
+		lt7911->video_edid_snapshot_len = length;
+	}
 	mutex_unlock(&lt7911->state_lock);
 
 	return simple_read_from_buffer(user_buffer, count, offset, edid,
@@ -1523,6 +1833,7 @@ static ssize_t proc_video_edid_write(struct file *file,
 {
 	struct lt7911_data *lt7911 = pde_data(file_inode(file));
 	u8 edid[LT7911EXC_EDID_MAX_SIZE];
+	bool had_shadow;
 	int ret;
 
 	if (lt7911->chip != LT7911_CHIP_LT7911EXC)
@@ -1541,10 +1852,15 @@ static ssize_t proc_video_edid_write(struct file *file,
 
 	disable_irq(lt7911->irq);
 	mutex_lock(&lt7911->exc_lock);
+	had_shadow = lt7911->shadow_len;
+	lt7911exc_drop_shadow(lt7911);
 	ret = lt7911exc_write_edid(lt7911, edid, count);
+	/* Flash already matched; the Shadow still holds the temporary EDID. */
+	if (ret == 1 && had_shadow)
+		ret = lt7911_reset(lt7911);
 	mutex_unlock(&lt7911->exc_lock);
 	enable_irq(lt7911->irq);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	mutex_lock(&lt7911->state_lock);
@@ -1555,6 +1871,57 @@ static ssize_t proc_video_edid_write(struct file *file,
 	mutex_unlock(&lt7911->state_lock);
 
 	return count;
+}
+
+/*
+ * Write a temporary EDID. It is presented at once, reapplied whenever the
+ * source reconnects, and lost on driver reload or a permanent write.
+ */
+static ssize_t proc_video_edid_shadow_write(struct file *file,
+					    const char __user *user_buffer,
+					    size_t count, loff_t *offset)
+{
+	struct lt7911_data *lt7911 = pde_data(file_inode(file));
+	u8 edid[LT7911EXC_EDID_MAX_SIZE];
+	u8 state;
+	int ret;
+
+	if (lt7911->chip != LT7911_CHIP_LT7911EXC)
+		return -EOPNOTSUPP;
+	if (count < LT7911EXC_EDID_BLOCK_SIZE ||
+	    count > LT7911EXC_EDID_MAX_SIZE ||
+	    count % LT7911EXC_EDID_BLOCK_SIZE)
+		return -EINVAL;
+	if (copy_from_user(edid, user_buffer, count))
+		return -EFAULT;
+	if (!lt7911_edid_checksum_valid(edid, count))
+		return -EINVAL;
+
+	disable_irq(lt7911->irq);
+	mutex_lock(&lt7911->exc_lock);
+	memcpy(lt7911->shadow_edid, edid, count);
+	lt7911->shadow_len = count;
+	ret = lt7911_read(lt7911, LT7911EXC_INFO_OFFSET, LT7911EXC_RX_STATE,
+			  &state);
+	/* Without an input the next load is caught by the watch. */
+	if (!ret && state > LT7911EXC_RX_NO_INPUT) {
+		ret = lt7911exc_apply_shadow(lt7911, true);
+		if (ret && ret != -ENODEV)
+			lt7911_reset(lt7911);
+	}
+	if (ret == -ENODEV)
+		ret = 0;
+	if (ret) {
+		lt7911exc_drop_shadow(lt7911);
+	} else {
+		lt7911_set_edid_snapshot(lt7911, edid, count);
+		queue_delayed_work(system_long_wq, &lt7911->shadow_work,
+				   msecs_to_jiffies(LT7911EXC_SHADOW_WATCH_MS));
+	}
+	mutex_unlock(&lt7911->exc_lock);
+	enable_irq(lt7911->irq);
+
+	return ret ? ret : count;
 }
 
 static ssize_t proc_video_edid_snapshot_read(struct file *file,
@@ -1637,21 +2004,20 @@ static ssize_t proc_fw_update_write(struct file *file,
 {
 	struct lt7911_data *lt7911 = pde_data(file_inode(file));
 	char buf[16];
+	char *command;
 	int ret;
 
 	if (lt7911->chip != LT7911_CHIP_LT7911EXC)
 		return -EOPNOTSUPP;
 
-	if (!count || count >= sizeof(buf))
-		return -EINVAL;
+	ret = lt7911_proc_command(user_buffer, count, buf, sizeof(buf),
+				  &command);
+	if (ret)
+		return ret;
+	if (!*command)
+		return count;
 
-	if (copy_from_user(buf, user_buffer, count))
-		return -EFAULT;
-	buf[count] = '\0';
-	if (buf[count - 1] == '\n')
-		buf[count - 1] = '\0';
-
-	if (strcmp(buf, "1") && strcmp(buf, "start"))
+	if (strcmp(command, "1") && strcmp(command, "start"))
 		return -EINVAL;
 
 	mutex_lock(&lt7911->fw_lock);
@@ -1717,6 +2083,10 @@ static const struct proc_ops proc_video_edid_fops = {
 
 static const struct proc_ops proc_video_edid_snapshot_fops = {
 	.proc_read = proc_video_edid_snapshot_read,
+};
+
+static const struct proc_ops proc_video_edid_shadow_fops = {
+	.proc_write = proc_video_edid_shadow_write,
 };
 
 static const struct proc_ops proc_version_fops = {
@@ -1785,6 +2155,13 @@ static int lt7911_proc_init(struct lt7911_data *lt7911)
 				      &proc_video_edid_snapshot_fops);
 	if (ret)
 		goto err;
+	if (lt7911->chip == LT7911_CHIP_LT7911EXC) {
+		ret = lt7911_create_proc_file(lt7911, PROC_VIDEO_EDID_SHADOW,
+					      0200,
+					      &proc_video_edid_shadow_fops);
+		if (ret)
+			goto err;
+	}
 	ret = lt7911_create_proc_file(lt7911, PROC_VERSION, 0644,
 				      &proc_version_fops);
 	if (ret)
@@ -1891,6 +2268,14 @@ static void lt7911_update_audio_status(struct lt7911_data *lt7911,
 
 	if (notify)
 		lt7911_notify(lt7911);
+}
+
+static void lt7911_mark_no_signal(struct lt7911_data *lt7911)
+{
+	struct lt7911_video_info video = { 0 };
+
+	lt7911_update_video_status(lt7911, &video);
+	lt7911_update_audio_status(lt7911, false, 0, true);
 }
 
 static int lt7911d_read_video_info(struct lt7911_data *lt7911,
@@ -2271,6 +2656,7 @@ static int lt7911_manage_probe(struct i2c_client *client)
 	mutex_init(&lt7911->state_lock);
 	mutex_init(&lt7911->exc_lock);
 	mutex_init(&lt7911->fw_lock);
+	INIT_DELAYED_WORK(&lt7911->shadow_work, lt7911exc_shadow_watch);
 	init_waitqueue_head(&lt7911->wait_queue);
 	atomic_set(&lt7911->event_seq, 0);
 	i2c_set_clientdata(client, lt7911);
@@ -2309,6 +2695,8 @@ static int lt7911_manage_probe(struct i2c_client *client)
 			size_t length = ((size_t)edid[126] + 1) * 128;
 
 			if (lt7911_edid_checksum_valid(edid, length)) {
+				memcpy(lt7911->video_edid, edid, length);
+				lt7911->video_edid_len = length;
 				memcpy(lt7911->video_edid_snapshot, edid, length);
 				lt7911->video_edid_snapshot_len = length;
 			}
@@ -2362,6 +2750,10 @@ static void lt7911_manage_remove(struct i2c_client *client)
 
 	lt7911->init_done = false;
 	lt7911_proc_remove(lt7911);
+	mutex_lock(&lt7911->exc_lock);
+	lt7911->shadow_len = 0;
+	mutex_unlock(&lt7911->exc_lock);
+	cancel_delayed_work_sync(&lt7911->shadow_work);
 
 	dev_info(&client->dev, "lt7911_manage module unloaded\n");
 }
