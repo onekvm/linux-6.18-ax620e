@@ -208,6 +208,52 @@
 	status = "okay";
 };
 
+/*
+ * The factory Wi-Fi start script writes 0x8 to all six SDIO pads before it
+ * loads the AIC8800 driver: drive strength 8, no pull, Schmitt trigger off.
+ * The PHY input delays above were tuned with these pads, so use the same.
+ */
+&sdio_clk_pins {
+	drive-strength = <8>;
+	bias-disable;
+	input-schmitt-disable;
+};
+
+&sdio_cmd_pins {
+	/delete-property/ bias-pull-up;
+	drive-strength = <8>;
+	bias-disable;
+	input-schmitt-disable;
+};
+
+&sdio_dat0_pins {
+	/delete-property/ bias-pull-up;
+	drive-strength = <8>;
+	bias-disable;
+	input-schmitt-disable;
+};
+
+&sdio_dat1_pins {
+	/delete-property/ bias-pull-up;
+	drive-strength = <8>;
+	bias-disable;
+	input-schmitt-disable;
+};
+
+&sdio_dat2_pins {
+	/delete-property/ bias-pull-up;
+	drive-strength = <8>;
+	bias-disable;
+	input-schmitt-disable;
+};
+
+&sdio_dat3_pins {
+	/delete-property/ bias-pull-up;
+	drive-strength = <8>;
+	bias-disable;
+	input-schmitt-disable;
+};
+
 &usb {
 	status = "okay";
 };
@@ -225,7 +271,7 @@
 };
 
 /*
- * Desk 1.47" JD9853. U-Boot on nanokvm-pro-105 already muxes SPI2 SCLK/MOSI,
+ * Desk 1.47" JD9853. The Pro Desk U-Boot already muxes SPI2 SCLK/MOSI,
  * CS GPIO0_A27, reset GPIO1_A9, DC GPIO1_A11 and TE GPIO2_A13. Do not enable
  * this node on the ATX board (ax630c-nanokvm-pro-atx.dts).
  *

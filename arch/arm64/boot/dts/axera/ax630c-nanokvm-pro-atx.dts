@@ -4,8 +4,8 @@
  * The model string still contains "ATX"; userspace reports this board as PCIe.
  *
  * Same boot description as the Desk DTB, with the JD9853 SPI panel and its
- * backlight hog removed. Do not boot this DTB on nanokvm-pro-105: that
- * unit's U-Boot pinmux is the Desk panel.
+ * backlight hog removed. Do not boot this DTB on a Pro Desk: its U-Boot
+ * pinmux is the Desk panel.
  *
  * The 0.96" 128x64 OLED is not the SG2002 C906L SHM device. The vendor
  * 4.19 NanoKVM DTS has no SSD1306 node, and i2c0 on that DTS is the LT6911

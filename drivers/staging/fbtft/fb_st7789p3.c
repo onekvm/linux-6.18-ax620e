@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * FB driver for the ST7789P3 LCD Controller
+ *
+ * OneKVM U-Boot runs the same init sequence on the NanoKVM Go, draws its
+ * logo and marks the panel onekvm,boot-logo; then the panel is not reset
+ * and keeps that logo until user space draws the first frame.
  */
 
 #include <linux/bitops.h>
@@ -13,6 +17,7 @@
 #include <linux/completion.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/property.h>
 
 #include <video/mipi_display.h>
 #include <linux/device.h>
@@ -75,6 +80,8 @@ enum st7789p3_command {
 
 static struct completion panel_te; /* completion for panel TE line */
 static int irq_te; /* Linux IRQ for LCD TE line */
+/* The bootloader's logo stays until user space draws; see init_display(). */
+static enum { BOOT_LOGO_NONE, BOOT_LOGO_KEEP, BOOT_LOGO_REPLACE } boot_logo;
 
 static irqreturn_t panel_te_handler(int irq, void *data)
 {
@@ -147,6 +154,18 @@ static int init_display(struct fbtft_par *par)
 	bool skip_init = dev->of_node &&
 			 of_property_read_bool(dev->of_node, "skip-init");
 	int rc;
+
+	/*
+	 * A reset would blank the bootloader's logo until the first frame. It
+	 * was drawn in the power-on address mode, which set_var() keeps only
+	 * without rotation or BGR order.
+	 */
+	boot_logo = BOOT_LOGO_NONE;
+	if (!par->info->var.rotate && !par->bgr &&
+	    device_property_read_bool(dev, "onekvm,boot-logo")) {
+		boot_logo = BOOT_LOGO_KEEP;
+		skip_init = true;
+	}
 
 	if (skip_init) {
 		dev_info(dev, "skip panel reset and init sequence\n");
@@ -229,6 +248,23 @@ static int write_vmem(struct fbtft_par *par, size_t offset, size_t len)
 {
 	struct device *dev = par->info->device;
 	int ret;
+
+	/*
+	 * fbtft's first update sends the empty buffer before user space can
+	 * draw: keep the boot logo instead. The first frame from user space
+	 * then replaces all of it, also rows that match the empty buffer.
+	 */
+	if (boot_logo == BOOT_LOGO_KEEP) {
+		boot_logo = BOOT_LOGO_REPLACE;
+		return 0;
+	}
+	if (boot_logo == BOOT_LOGO_REPLACE) {
+		boot_logo = BOOT_LOGO_NONE;
+		par->fbtftops.set_addr_win(par, 0, 0, par->info->var.xres - 1,
+					   par->info->var.yres - 1);
+		offset = 0;
+		len = par->info->fix.line_length * par->info->var.yres;
+	}
 
 	dev_dbg(dev, "write_vmem len: %zu\n", len);
 	if (irq_te) {

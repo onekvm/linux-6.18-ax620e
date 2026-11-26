@@ -130,9 +130,17 @@
 	role-switch-default-mode = "peripheral";
 };
 
+/*
+ * As on the factory DT, a stuck bus (seen as "lost arbitration" from the
+ * touch controller) is freed by clocking SCL through its GPIO.
+ */
 &i2c0 {
 	status = "okay";
 	clock-frequency = <400000>;
+	pinctrl-names = "default", "gpio";
+	pinctrl-1 = <&go_i2c0_scl_gpio &go_i2c0_sda_gpio>;
+	scl-gpios = <&gpio0 24 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+	sda-gpios = <&gpio0 25 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
 	lt7911: displayport-receiver@41 {
 		compatible = "lontium,lt7911exc";
 		reg = <0x41>;
@@ -141,17 +149,26 @@
 		irq-gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
 		reset-gpios = <&gpio1 1 GPIO_ACTIVE_HIGH>;
 	};
+	/*
+	 * The factory DT declares this sensor, but no unit answers at 0x18 or
+	 * 0x19, also under the factory firmware, and the DT names no supply or
+	 * enable pin. Keep the description for a board that populates it.
+	 */
 	accelerometer@19 {
 		compatible = "silan,sc7a20";
 		reg = <0x19>;
 		mount-matrix = "1", "0", "0", "0", "1", "0", "0", "0", "1";
+		status = "disabled";
 	};
 };
 
 &i2c1 {
 	status = "okay";
-	pinctrl-names = "default";
+	pinctrl-names = "default", "gpio";
 	pinctrl-0 = <&go_i2c1_scl &go_i2c1_sda>;
+	pinctrl-1 = <&go_i2c1_scl_gpio &go_i2c1_sda_gpio>;
+	scl-gpios = <&gpio0 26 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+	sda-gpios = <&gpio0 27 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
 	touchscreen@15 {
 		compatible = "hyn,8xxt";
 		reg = <0x15>;
@@ -207,8 +224,12 @@
 	go_wifi_reset: go-wifi-reset { pins = "EPHY_LED0"; function = "GPIO1_A28"; };
 	go_bridge_irq: go-bridge-irq { pins = "UART2_TXD"; function = "GPIO1_A0"; bias-pull-up; };
 	go_bridge_reset: go-bridge-reset { pins = "UART2_RXD"; function = "GPIO1_A1"; };
-	go_i2c1_scl: go-i2c1-scl { pins = "I2C1_SCL"; function = "I2C1_SCL"; };
-	go_i2c1_sda: go-i2c1-sda { pins = "I2C1_SDA"; function = "I2C1_SDA"; };
+	go_i2c1_scl: go-i2c1-scl { pins = "I2C1_SCL"; function = "I2C1_SCL"; drive-strength = <3>; bias-pull-up; };
+	go_i2c1_sda: go-i2c1-sda { pins = "I2C1_SDA"; function = "I2C1_SDA"; drive-strength = <3>; bias-pull-up; };
+	go_i2c0_scl_gpio: go-i2c0-scl-gpio { pins = "I2C0_SCL"; function = "GPIO0_A24"; drive-strength = <3>; bias-pull-up; };
+	go_i2c0_sda_gpio: go-i2c0-sda-gpio { pins = "I2C0_SDA"; function = "GPIO0_A25"; drive-strength = <3>; bias-pull-up; };
+	go_i2c1_scl_gpio: go-i2c1-scl-gpio { pins = "I2C1_SCL"; function = "GPIO0_A26"; drive-strength = <3>; bias-pull-up; };
+	go_i2c1_sda_gpio: go-i2c1-sda-gpio { pins = "I2C1_SDA"; function = "GPIO0_A27"; drive-strength = <3>; bias-pull-up; };
 	go_touch_irq: go-touch-irq { pins = "VI_D2"; function = "GPIO0_A2"; bias-pull-up; };
 	go_touch_reset: go-touch-reset { pins = "VI_D4"; function = "GPIO0_A4"; };
 	go_spi_clk: go-spi-clk { pins = "RGMII_TXCLK"; function = "SPI_M2_SCLK_M"; drive-strength = <3>; };
